@@ -1,0 +1,1399 @@
+#!/usr/bin/env bash
+#scvc
+###############################################################################
+#
+#  System Configuration Version Control.
+#
+#  All rights reserved - Garry Iglesias 2014-2016.
+#
+###############################################################################
+# WARNING: This utility handles HIGHLY SENSITIVE files ! You should know what
+# you do, being a wise system administrator.
+#
+# DO NOT COPY OR CLONE DATABASE TO SOME ACCESSIBLE LOCATION !!
+# DATABASE CAN HOLD SYSTEM PASSWORDS AND SECURITY CONFIGURATION FILES !!
+#
+###############################################################################
+# Usage:
+#   # scvc [options] [command] [arg1 [arg2 [arg3 [...]]]]
+#
+# Where command can be:
+#   help
+#   listTracked[{Files|Directories}]
+#   track [pathToTrack]
+#   trackedCheck
+#   edit{Config|Ignore|Tracked[{Files|Directories}]}
+#   snapshot
+#   pushRepo
+#   snapAndPush
+#   gcRepo
+#   wipeRepo
+#   listCommands
+#
+# Advices:
+#  - make a snapshot after each configuration change, or group of changes.
+#  - make a snapshot BEFORE AND AFTER each system upgrade, easier to rollback
+# changes, and to be sure you have a backup of the last state before updating.
+#  - make a script for system update that snapshot automatically.
+#
+###############################################################################
+set -Cue
+
+#######################################
+# Configuration file path:
+readonly SCVC_HOME_DUMMY='/root'
+readonly SCVC_HOME="${HOME:-SCVC_HOME_DUMMY}"
+readonly SCVC_SYSCONFIG_PATH='/etc/scvc.conf'
+readonly SCVC_USERCONFIG_PATH="$SCVC_HOME/.scvc.conf"
+
+#######################################
+# Default db path:
+readonly SCVC_SYSDEFAULTDB='/var/scvc.db'
+readonly SCVC_USERDEFAULTDB="$SCVC_HOME/var/scvc.db"
+
+#######################################
+# Magicks:
+readonly LAUNCH_DIR="$( pwd )"
+readonly SCRIPT_DIR="$( cd "$(dirname "$0")" && pwd )"
+readonly SCRIPT_NAME="$( basename "$0" )"
+readonly LOCAL_HOSTNAME="$( hostname )"
+readonly GIT_CMD="$(which git)"
+readonly TAC_CMD="$(which tac || (which cat && echo " -u" ) )"
+
+readonly SCVC_SELF="${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+#######################################
+# Internal Default Parameters:
+SCVC_CONFIG_MODE="${SCVC_CONFIG_MODE:-auto}"
+#SCVC_DB_ROOT='/var/scvc.db'
+SCVC_USER="${SCVC_USER:-$USER}"
+SCVC_GROUP="${SCVC_GROUP:-$( groups | cut -d\  -f1 )}"
+SCVC_GIT_BRANCH="${SCVC_GIT_BRANCH:-}"
+SCVC_GIT_REMOTEREPONAME="${SCVC_GIT_REMOTEREPONAME:-}"
+SCVC_GIT_REMOTEREPO="${SCVC_GIT_REMOTEREPO:-}"
+#SCVC_GIT_REMOTEUSER="${SCVC_GIT_REMOTEUSER:-$(who am i)}"
+
+#######################################
+# Internal flags:
+isRoot=$(( $EUID==0 ))
+isIgnoreGit=0
+isDisableInit=0
+isBatchMode=0
+isAutoCheck=1
+isShowSecurityWarning=1
+
+###############################################################################
+# Some internal constants:
+###############################################################################
+readonly SELF_NAME='self'
+readonly TRACKLIST_NAME='tracked'
+readonly CACHE_ROOTNAME='cache'
+readonly SHARED_NAME='shared'
+readonly SNAPSHOTRC='snapshotrc'
+readonly FILES_SUFFIX='.files'
+readonly DIRS_SUFFIX='.directories'
+# Sed rules:
+readonly sedRule_removeTrailingSlash='s,/$,,g'
+
+###############################################################################
+# Some system functions:
+###############################################################################
+
+#######################################
+nsk-error () {
+    echo "$@" >&2
+    exit 1
+}
+
+#######################################
+nsk-enforceDirectory () {
+    [[ -d "$1" ]] || mkdir -p "$1" || nsk-error "Couldn't create directory: '$1'"
+}
+
+#######################################
+nsk-resetDirectory () {
+    [[ ! -d "$1" ]] || rm -r "$1" || nsk-error "Couldn't remove directory: '$1'"
+    mkdir -p "$1" || nsk-error "Couldn't create directory: '$1'"
+}
+
+#######################################
+nsk-ensureAbsolutePath () {
+ #   echo "Making '$1' '${1:0:1}' absolute..." >&2
+    [[ "${1:0:1}" == "/" ]] && echo "$1" || echo "$LAUNCH_DIR/$1"
+}
+
+#######################################
+nsk-userEditFile () {
+    if [[ -n "${EDITOR:-}" ]] ; then
+	"$EDITOR" "$@"
+    else nsk-error "Environment variable EDITOR undefined !"
+    fi
+}
+
+#######################################
+nsk-sortAndRemoveDuplicate () {
+    if [[ -f "$1" ]] ; then
+	local sorted
+	sorted="$(mktemp)"
+	<"$1" sort -u >>"$sorted" && rm "$1" && mv "$sorted" "$1"
+    else nsk-error "File '$1' not found !"
+    fi
+}
+
+#######################################
+nsk-sortAndRemoveDuplicateAndSed () {
+    if [[ -f "$1" ]] ; then
+	local sorted listName="$1"
+	sorted="$(mktemp)"
+	shift
+	<"$listName" sort -u | sed "$@" >>"$sorted"  && rm "$listName" && mv "$sorted" "$listName"
+    else nsk-error "File '$1' not found !"
+    fi
+}
+
+###############################################################################
+# Git Wrapper:
+###############################################################################
+
+#######################################
+scvc-git-cmd () {
+    ( cd "$SCVC_DB_ROOT" && "$GIT_CMD" "$@" )
+}
+
+#######################################
+scvc-git-init () { scvc-git-cmd init "$@" || nsk-error "Failed to initialized git repository at: '$SCVC_DB_ROOT' !" ; }
+
+#######################################
+scvc-git-status () { scvc-git-cmd status --porcelain -uall "$@" ; }
+
+#######################################
+scvc-git-reset () { scvc-git-cmd reset "$@" ; }
+
+#######################################
+scvc-git-add () { scvc-git-cmd add "$@" ; }
+
+#######################################
+scvc-git-checkout () { scvc-git-cmd checkout "$@" ; }
+
+#######################################
+scvc-git-checkoutBranch () { scvc-git-checkout -q "$SCVC_GIT_BRANCH" ; }
+
+#######################################
+scvc-git-remote () { scvc-git-cmd remote "$@" ; }
+
+#######################################
+scvc-git-branch () { scvc-git-cmd branch "$@" ; }
+
+#######################################
+scvc-git-fetch () { scvc-git-cmd fetch "$@" ; }
+
+#######################################
+scvc-git-push () { scvc-git-cmd push "$@" ; }
+
+#######################################
+# Check the working branch, create it if it doesn't exist.
+scvc-git-checkBranch () {
+    # Check if a working branch is specified:
+    if [[ -n "$SCVC_GIT_BRANCH" ]] ; then
+	if (( !isGitVirgin )) ; then
+            # Check if our branch exist:
+	    if scvc-git-checkoutBranch ; then
+                # Branch exists, we accept it...
+		isGitValidBranch=1
+	    else
+		# Missing branch -> create it:
+		echo "Warning: Creating missing branch '$SCVC_GIT_BRANCH'..." >&2
+		scvc-git-checkout -q -b "$SCVC_GIT_BRANCH" || nsk-error "Couldn't create git branch '$SCVC_GIT_BRANCH' !"
+		# We might be able to accept it now...
+		isGitValidBranch=1
+	    fi
+	else
+	    # Forcing the 'current' branch (this makes the birth name of the initial commit...)
+	    scvc-git-checkout -q -B "$SCVC_GIT_BRANCH"
+	    # On a virgin, we accept as the birth name.
+	    isGitValidBranch=1
+	fi
+	# Note: as for now every path set a valid branch 'somehow' (or throw error).
+	# it might be tempting to factorize isGitValidBranch. But it's better to
+	# keep separated explicit cases, and we might even find some cases where we
+	# do NOT accept the branch name... Maybe...(like some "special secure mode" or so...)
+    else echo "Warning: No working git branch specified ! (try: # ${SCRIPT_NAME} editConfig)" >&2
+    fi
+}
+
+#######################################
+scvc-git-checkRemote () {
+    # Check if a remote repository is specified:
+    if [[ -n "$SCVC_GIT_REMOTEREPONAME" ]] ; then
+	# Check if our remote name exist:
+	if scvc-git-remote | grep -q "^$SCVC_GIT_REMOTEREPONAME\$" ; then
+	    # We accept this remote repository:
+	    isGitValidRemote=1
+	else
+	    # Notify missing...
+	    echo "Warning: The specified remote repository doesn't exist: '$SCVC_GIT_REMOTEREPONAME'" >&2
+	    if [[ -n "$SCVC_GIT_REMOTEREPO" ]] ; then
+		echo "Adding specified remote repo: [$SCVC_GIT_REMOTEREPONAME] '$SCVC_GIT_REMOTEREPO'" >&2
+		# One was specified, use it:
+		scvc-git-remote add "$SCVC_GIT_REMOTEREPONAME" "$SCVC_GIT_REMOTEREPO" \
+		    || nsk-error "Couldn't add the specified repository: '$SCVC_GIT_REMOTEREPO'"
+		# Fetch from it:
+		scvc-git-fetch "$SCVC_GIT_REMOTEREPONAME" \
+		    || nsk-error "Failed to fetch from remote repo '$SCVC_GIT_REMOTEREPONAME' !"
+		# Bind branch if a remote exists:
+		if (( isGitValidBranch )) && (( ! isGitVirgin )) ; then
+		    local remoteName="${SCVC_GIT_REMOTEREPONAME}/${SCVC_GIT_BRANCH}"
+		    # We found the remote branch ?
+		    if scvc-git-branch -r | grep -q " *${remoteName}\$" ; then
+			echo "Detected remote branch with same name -> tracking it." >&2
+			if (( isGitVirgin )) ; then
+			    # On a 'virgin' git with existing remote branch we are in a
+			    # "corner case".
+			    # For now I assume that it's just a "restart" from a test
+			    # installation or development case...
+			    # Maybe we should "check" this case for a "production script"
+			    # but it is not my ambition for now.
+			    #TODO: Have a "dev/unsecure" and a "production" mode so we
+			    # can send an error if this case happens unexpectedly ->
+			    # it could be an error:
+
+			    # Well we forget about the old one:
+			    nsk-error "Unsupported case !"
+			else
+			    # Yes! track it:
+			    if false ; then
+				# "Old way":
+				scvc-git-branch --set-upstream "$SCVC_GIT_BRANCH" "$remoteName" \
+				    || nsk-error "Failed to setup branch remote tracking !"
+			    else
+				# "New way":
+				scvc-git-branch --set-upstream-to="$remoteName" "$SCVC_GIT_BRANCH"  \
+				    || nsk-error "Failed to setup branch remote tracking !"
+			    fi
+			fi
+		    fi
+		fi
+		# And we accept this new addition:
+		isGitValidRemote=1
+	    fi
+	fi
+    fi
+
+}
+
+#######################################
+scvc-git-checkTopGitIgnore () {
+    # Check shared git ignore:
+    if [[ ! -f "$GIT_SHAREDIGNORE" ]] ; then
+	# Generate default shared git ignore:
+	cat >"$GIT_SHAREDIGNORE" <<SHARED_IGNORE
+# System Configuration Version Control - Shared Git Ignore Rules.
+
+# Some temporary files:
+*~
+*#
+*.log
+
+# Mutt cache:
+*/cache/home/*/.mutt/cache
+
+# [**] doesn't work in earlier version of git (<2.0 ? 1.7 doesn't have it... )
+#/**/.mutt/cache
+
+SHARED_IGNORE
+    fi
+}
+
+#######################################
+scvc-git-checkHostGitIgnore () {
+    # Check local host git ignore:
+    if [[ ! -f "$GIT_LOCALIGNORE" ]] ; then
+	# Generate local host specific git ignore:
+	cat >"$GIT_LOCALIGNORE" <<SHARED_IGNORE
+# System Configuration Version Control - $LOCAL_HOSTNAME Git Ignore Rules.
+
+# Some configuration files:
+#*.old
+#*.new
+
+SHARED_IGNORE
+    fi
+}
+
+#######################################
+scvc-git-load () {
+    # Some Global Git states:
+    isGitValidLocal=0
+    isGitValidBranch=0
+    isGitValidRemote=0
+    isGitVirgin=0
+
+    # Check if a git repo is here:
+    if [[ ! -d "$GIT_DIR" ]] ; then
+	echo " ! No Git repository found: creating a new one..." >&2
+	scvc-git-init
+    fi
+    # Now that we should have a valid repo, secondary checks:
+    if [[ -d "$GIT_DIR" ]] ; then
+
+	# Check if is virgin:
+	isGitVirgin=$(( $( scvc-git-branch | wc -l )==0 ))
+
+	# Working Branch:
+	scvc-git-checkBranch
+
+	# Remote Repo
+	scvc-git-checkRemote
+
+	# Check gitignores:
+	scvc-git-checkTopGitIgnore
+	scvc-git-checkHostGitIgnore
+
+	# We accept this local repository:
+	isGitValidLocal=1
+    fi
+
+    # Git state Feedback:
+    if (( isGitValidLocal )) ; then
+	(( !isGitVirgin )) || echo " ! Virgin git repository !" >&2
+	(( isGitValidBranch )) && echo " * Working on branch: '$SCVC_GIT_BRANCH'" >&2 || echo " ! No working branch!" >&2
+	(( isGitValidRemote )) && echo " * Working with remote: '$SCVC_GIT_REMOTEREPONAME'" >&2 || echo " ! No active remote repository!" >&2
+    else echo "Invalid git repository!" >&2
+    fi
+}
+
+###############################################################################
+# SCVC Configuration:
+###############################################################################
+
+#######################################
+scvc-conf-systemMode () {
+    # Root/Global configuration can only be used by root:
+    (( isRoot )) || nsk-error "System wide configuration only accessible to root !"
+    CONFIG_PATH="$SCVC_SYSCONFIG_PATH"
+    SCVC_DB_ROOT="$SCVC_SYSDEFAULTDB"
+}
+
+#######################################
+scvc-conf-userMode () {
+    CONFIG_PATH="$SCVC_USERCONFIG_PATH"
+    SCVC_DB_ROOT="$SCVC_USERDEFAULTDB"
+}
+
+#######################################
+scvc-conf-checkOrDefault () {
+    if [[ ! -f "$CONFIG_PATH" ]] ; then
+	# No configuration file found, create a new one:
+	cat >&2 <<NO_CONFIG_MSG
+
+!! Warning !! No configuration file found. We will now
+create a new one at '$CONFIG_PATH'...
+
+NO_CONFIG_MSG
+
+	# Create directory for configuration:
+	local configDir
+	configDir="$( dirname "$CONFIG_PATH" )"
+	nsk-enforceDirectory "$configDir"
+
+	# Now generate the default configuration:
+	cat >"$CONFIG_PATH" <<DEFAULT_CONFIG
+#'$CONFIG_PATH'
+###############################################################################
+#
+# System Configuration Version Control. Local configuration.
+#
+###############################################################################
+
+# Specify the local database directory:
+SCVC_DB_ROOT="$( echo "$SCVC_DB_ROOT" | sed -e "s,$HOME,\$HOME,g" )"
+
+# Specify the owner of the local database:
+#SCVC_USER='$SCVC_USER'
+#SCVC_GROUP='$SCVC_USER'
+
+# Some git repository settings:
+#SCVC_GIT_BRANCH='${SCVC_GIT_BRANCH:-master}'
+#SCVC_GIT_REMOTEREPONAME='${SCVC_GIT_REMOTEREPONAME:-origin}'
+#SCVC_GIT_REMOTEREPO='${SCVC_GIT_REMOTEREPO:-/path/to/remote}'
+DEFAULT_CONFIG
+#SCVC_GIT_REMOTEUSER='${SCVC_GIT_REMOTEUSER:-repousername}'
+
+	# And nicely offer user to modify it:
+	nsk-userEditFile "$CONFIG_PATH"
+    fi
+}
+
+###############################################################################
+# SCVC Inline Configuration loading:
+###############################################################################
+(( !isRoot )) || echo " * Welcome root..." >&2
+
+#######################################
+# Check configuration mode and lookup for configurations:
+if [[ -z "${CONFIG_PATH:-}" ]] ; then
+    case "$SCVC_CONFIG_MODE" in
+	'root'|'system'|'global') scvc-conf-systemMode ;;
+	'user'|'local') scvc-conf-userMode ;;
+	'auto')
+	    if (( isRoot )) ; then
+		# Root can have a user AND the global configuration.
+		# Automatic mode check first for he's user config.
+		# If none found, system wide is the default.
+		if [[ -f "$SCVC_USERCONFIG_PATH" ]] ; then scvc-conf-userMode
+		elif [[ -f "$SCVC_SYSCONFIG_PATH" ]] ; then scvc-conf-systemMode
+		else
+		    # Anyway, if root, default is system wide:
+		    echo " ! Root user default to system wide configuration." >&2
+		    scvc-conf-systemMode
+		fi
+		[[ ! -f "$CONFIG_PATH" ]] || echo " * Automatic configuration found at: '$CONFIG_PATH'" >&2
+	    else
+		# Simple user can only have a user configuration:
+		scvc-conf-userMode
+	    fi
+	    ;;
+	*) nsk-error "Error: Unknown configuration mode '$SCVC_CONFIG_MODE'!" ;;
+    esac
+elif [[ ! -f "$CONFIG_PATH" ]] && [[ -z "${SCVC_DB_ROOT:-}" ]] ; then
+    nsk-error "Error: when using CONFIG_PATH on a new configuration you must also specify SCVC_DB_ROOT."
+else
+    echo " ! User specified configuration file: '$CONFIG_PATH'" >&2
+fi
+
+#######################################
+# Sanity check configuration path:
+[[ -n "$CONFIG_PATH" ]] || nsk-error "Internal Error: invalid 'CONFIG_PATH' !"
+
+#######################################
+# Check for missing configuration:
+scvc-conf-checkOrDefault
+
+#######################################
+# Load configuration:
+. "$CONFIG_PATH" || nsk-error "Couldn't load configuration: '$CONFIG_PATH'"
+
+###############################################################################
+# SCVC Context:
+###############################################################################
+
+#######################################
+scvc-ctx-init () {
+    # Database objects variables:
+    SELF_DIR="${SCVC_DB_ROOT}/${SELF_NAME}"
+    SHARED_ROOT="${SCVC_DB_ROOT}/${SHARED_NAME}"
+    HOST_ROOT="${SCVC_DB_ROOT}/${LOCAL_HOSTNAME}"
+    TRACK_SHARED_FILELIST="${SHARED_ROOT}/${TRACKLIST_NAME}${FILES_SUFFIX}"
+    TRACK_SHARED_DIRLIST="${SHARED_ROOT}/${TRACKLIST_NAME}${DIRS_SUFFIX}"
+    TRACK_FILELIST="${HOST_ROOT}/${TRACKLIST_NAME}${FILES_SUFFIX}"
+    TRACK_DIRLIST="${HOST_ROOT}/${TRACKLIST_NAME}${DIRS_SUFFIX}"
+    CACHE_ROOTDIR="${HOST_ROOT}/${CACHE_ROOTNAME}"
+    SHARED_RC="${SHARED_ROOT}/${SNAPSHOTRC}"
+    HOST_RC="${HOST_ROOT}/${SNAPSHOTRC}"
+    # Git variables:
+    GIT_DIR="${SCVC_DB_ROOT}/.git"
+    GIT_SHAREDIGNORE="${SCVC_DB_ROOT}/.gitignore"
+    GIT_LOCALIGNORE="${HOST_ROOT}/.gitignore"
+}
+
+#######################################
+scvc-ctx-clear () {
+    # Unbind context's variables:
+    unset SELF_DIR HOST_ROOT SHARED_ROOT \
+	TRACK_FILELIST TRACK_DIRLIST \
+        TRACK_SHARED_FILELIST TRACK_SHARED_DIRLIST \
+	CACHE_ROOTDIR \
+        SHARED_RC HOST_RC \
+	GIT_DIR \
+	GIT_SHAREDIGNORE GIT_LOCALIGNORE
+}
+
+#######################################
+scvc-ctx-setPerms () {
+    chown ${SCVC_USER}:${SCVC_GROUP} "$@"
+    chmod 0700 "$@"
+}
+
+#######################################
+scvc-ctx-load () {
+    # build context:
+    scvc-ctx-init
+
+    # check db root:
+    if [[ ! -d "$SCVC_DB_ROOT" ]] ; then
+	echo "Warning: DB root directory is missing. Creating: '$SCVC_DB_ROOT'" >&2
+	mkdir -p "$SCVC_DB_ROOT" || nsk-error "Failed to create DB root directory: '$SCVC_DB_ROOT'"
+    fi
+
+    # check mandatory directories:
+    nsk-enforceDirectory "$SELF_DIR"
+    nsk-enforceDirectory "$CACHE_ROOTDIR"
+    nsk-enforceDirectory "$SHARED_ROOT"
+
+    # load git context:
+    (( isIgnoreGit )) || scvc-git-load || nsk-error "Failed loading git context!"
+
+    # Ensure everything is on track (or fix it):
+    if (( !isDisableInit )) ; then
+	touch "$TRACK_FILELIST" "$TRACK_DIRLIST" "$TRACK_SHARED_FILELIST" "$TRACK_SHARED_DIRLIST"
+
+	# We must not recurse into the cache directory in order to avoid
+	# breaking shadow permissions. So we cherry pick what we can...
+	scvc-ctx-setPerms \
+	    "$SCVC_DB_ROOT" "$SCVC_DB_ROOT"/* \
+            "$SHARED_ROOT" "$SHARED_ROOT"/* \
+	    "$HOST_ROOT" "$HOST_ROOT"/* \
+	    "$CACHE_ROOTDIR"
+    fi
+}
+
+###############################################################################
+# SCVC DB:
+###############################################################################
+
+#######################################
+scvc-db-trackFile () {
+    echo " * Tracking file '$1'..." >&2
+    local dir name fixedDir trackList
+    dir="$( dirname "$1" )"
+    name="$( basename "$1" )"
+    fixedDir="$( cd "$dir" && pwd )"
+    if (( SCVC_SHARED_TRACK )) ; then trackList="$TRACK_SHARED_FILELIST"
+    else trackList="$TRACK_FILELIST"
+    fi
+    if [[ -n "$fixedDir" ]] && [[ -d "$fixedDir" ]] ; then
+	local fixedPath="${fixedDir}/${name}"
+	echo "$fixedPath" | sed -e 's,^//,/,g' >>"$trackList"
+    else nsk-error "Couldn't understand path '$1' ($fixedDir ?) !"
+    fi
+}
+
+#######################################
+scvc-db-trackDirectory () {
+    echo " * Tracking directory '$1'..." >&2
+    local fixedPath trackList
+    fixedPath="$( cd "$1" && pwd )"
+    if (( SCVC_SHARED_TRACK )) ; then trackList="$TRACK_SHARED_DIRLIST"
+    else trackList="$TRACK_DIRLIST"
+    fi
+    if [[ -n "$fixedPath" ]] && [[ -d "$fixedPath" ]] ; then
+	echo "$fixedPath" >>"$trackList"
+    else nsk-error "Couldn't understand directory '$1' ($fixedPath) !"
+    fi
+}
+
+#######################################
+scvc-db-cleanTrackedLists () {
+    # Clean shared:
+    nsk-sortAndRemoveDuplicate "$TRACK_SHARED_FILELIST"
+    nsk-sortAndRemoveDuplicateAndSed "$TRACK_SHARED_DIRLIST" -e "$sedRule_removeTrailingSlash"
+    # Clean host:
+    nsk-sortAndRemoveDuplicate "$TRACK_FILELIST"
+    nsk-sortAndRemoveDuplicateAndSed "$TRACK_DIRLIST" -e "$sedRule_removeTrailingSlash"
+}
+
+#######################################
+scvc-db-resetCache () {
+    nsk-resetDirectory "$CACHE_ROOTDIR"
+}
+
+#######################################
+scvc-db-cacheFile () {
+#    echo "CACHE=${CACHE_ROOTDIR} FILE=${1}"
+    cp -R --preserve=all --parents -t "${CACHE_ROOTDIR}" "${1}" || nsk-error "Failed to snapshot file: '$1'"
+}
+
+#######################################
+scvc-db-cacheDir () {
+#    echo "CACHE=${CACHE_ROOTDIR} DIR=${1}"
+    cp -R --preserve=all --parents -t "${CACHE_ROOTDIR}" "${1}" || nsk-error "Failed to snapshot directory: '$1'"
+}
+
+#######################################
+scvc-db-snapshotSelf () {
+    cp "$SCVC_SELF" "${SELF_DIR}/${SCRIPT_NAME}" || nsk-error "Failed to snapshot self !"
+}
+
+#######################################
+scvc-db-snapshotFiles () {
+#    local eachFile
+    echo " * Processing files snapshot..."
+#    while IFS= read eachFile ; do scvc-db-cacheFile "$eachFile" ; done <"$TRACK_FILELIST"
+    cat "$TRACK_SHARED_FILELIST" "$TRACK_FILELIST" | sort -u | while IFS= read eachFile ; do scvc-db-cacheFile "$eachFile" ; done
+}
+
+#######################################
+scvc-db-snapshotDirectories () {
+#    local eachDir
+    echo " * Processing directories snapshot..."
+#    while IFS= read eachDir ; do scvc-db-cacheDir "$eachDir" ; done <"$TRACK_DIRLIST"
+    cat "$TRACK_SHARED_DIRLIST" "$TRACK_DIRLIST" | sort -u | while IFS= read eachDir ; do scvc-db-cacheDir "$eachDir" ; done
+}
+
+#######################################
+# Allow user hooks for custom snapshots.
+scvc-db-snapshotCustomRC () {
+    [[ ! -f "$SHARED_RC" ]] || source "$SHARED_RC"
+    [[ ! -f "$HOST_RC" ]] || source "$HOST_RC"
+}
+
+#######################################
+scvc-db-snapshotToCache () {
+    echo " * Executing snapshot..."
+    scvc-db-resetCache
+    scvc-db-snapshotSelf
+    scvc-db-snapshotFiles
+    scvc-db-snapshotDirectories
+    scvc-db-snapshotCustomRC
+    echo "> '$LOCAL_HOSTNAME' cache size: $( du -bhs "$CACHE_ROOTDIR" | cut -f1 )." >&2
+}
+
+#######################################
+scvc-db-importDelta () {
+    local fromRev="$1" toRev="${2:-}"
+    # If only one argument -> this is the "to(target) revision".
+    if [[ -z "$toRev" ]] ; then
+        toRev="$fromRev"
+        fromRev=
+    fi
+    # Extract the revision diff tree, and apply it
+    # to the current branch.
+    echo "scvc-git-cmd diff-tree --name-status -r $fromRev $toRev"
+    scvc-git-cmd diff-tree --no-commit-id --name-status -r $fromRev $toRev \
+        | while IFS= read eachFile ; do
+        curStatus="$( echo "$eachFile" | cut -f1 )"
+        curPath="$( echo "$eachFile" | cut -f2- )"
+        echo " * Importing '$eachFile' ($curStatus|$curPath)."
+        case "$curStatus" in
+            'M'|'A')
+                scvc-git-cmd checkout "$toRev" "$curPath" \
+                    || nsk-error "Failed to acquire final revision of: '$curPath'"
+                scvc-git-cmd add "$curPath" || nsk-error "Failed to add file '$curPath'"
+                ;;
+            'D')
+                scvc-git-cmd rm "$curPath" || nsk-error "Failed to remove file '$curPath'"
+                ;;
+            *) nsk-error "Unknown diff status '$curStatus'" ;;
+        esac
+    done
+}
+
+#######################################
+scvc-db-commitVersion () {
+    local shortMessage="${1:-}"
+    echo " * Commiting configuration version..."
+    # Handle db files status:
+    scvc-git-status | while IFS= read eachGitStatus ; do
+	gitCode="${eachGitStatus:0:2}"
+	gitFileName="${eachGitStatus:3}"
+#	echo "GITCODE=$gitCode FILENAME='$gitFileName'" >&2
+	case "$gitCode" in
+	    # New file:
+	    '??'|?'M')
+		scvc-git-add "$gitFileName"
+		;;
+#	    ' M') scvc-git-add "$gitFileName" ;;
+	    # Removed file:
+	    ?'D') scvc-git-cmd rm "$gitFileName" ;;
+	    # Ignore:
+	    'A '|'M '|'D '|'R ') ;;
+	    # Errors:
+	    *) echo "Unkwown GITCODE='$gitCode' !" >&2 ;;
+	esac
+    done || nsk-error "Problem while applying file git status !"
+
+    # Call git to generate commit message and verify
+    # if there's somthing to commit:
+    local gitCommitMessage
+    gitCommitMessage="$(mktemp)"
+    if scvc-git-cmd commit --dry-run >>"$gitCommitMessage" ; then
+	local commitMessage filteredMessage
+	commitMessage="$(mktemp)"
+	filteredMessage="$(mktemp)"
+	if (( isBatchMode )) ; then
+	    # Generate an automatic commit message:
+	    cat >>"$commitMessage" <<BATCH_COMMIT_MSG
+SCVC - Batch Commit. $shortMessage
+
+BATCH_COMMIT_MSG
+	    # Append git's one, uncommented:
+	    <"$gitCommitMessage" sed -e 's,^#,,g' >>"$commitMessage"
+	else
+	    # Generate a commented default commit message.
+	    sed -e "s,^,#,g" >>"$commitMessage" <<COMMIT_MSG
+ (Lines starting with # will be ignored)
+
+ System Configuration Version Control Commit.
+
+ Changes:
+
+COMMIT_MSG
+	    # Append git's one, as is:
+	    <"$gitCommitMessage" cat >>"$commitMessage"
+	fi
+
+	# Edit commit message:
+	if (( isBatchMode )) || [[ -n "${EDITOR:-}" ]] ; then
+	    # echo "Editing with '$EDITOR' file '$commitMessage'" >&2
+	    (( isBatchMode )) || "$EDITOR" "$commitMessage"
+	    if <"$commitMessage" grep -v "^#" >>"$filteredMessage" ; then
+		# Do the commit:
+		scvc-git-cmd commit -q -F "$filteredMessage" || nsk-error "Problem while commiting..."
+	    else nsk-error "Commit message is empty !"
+	    fi
+	else nsk-error "Environment is missing variable 'EDITOR' !"
+	fi
+
+	# Clean temps:
+	rm "$commitMessage" "$filteredMessage"
+    else echo " ! No changes to commit !" >&2
+    fi
+
+    # Clean temps:
+    rm "$gitCommitMessage"
+
+    # Debug Status:
+#    echo "DBG> Status:" >&2
+#    scvc-git-status >&2
+}
+
+###############################################################################
+# SCVC Notifications:
+###############################################################################
+
+scvc-showBanner () {
+    echo "System Configuration Version Control - Garry Iglesias 2014-2016." >&2
+}
+
+scvc-showSecurityWarning () {
+    (( isBatchMode || !isShowSecurityWarning )) || cat >&2 <<WARNING
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!                                                     !!
+!! SECURITY WARNING:                                   !!
+!!                                                     !!
+!! System Configuration Version Control handles highly !!
+!! sensitive files. You MUST be very careful where you !!
+!! store clones or copies of the Database, and WHO can !!
+!! access it !                                         !!
+!!                                                     !!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+WARNING
+}
+
+###############################################################################
+# SCVC Commands:
+###############################################################################
+readonly SCVC_CMD_PREFIX='scvc-cmd-'
+
+#######################################
+scvc-check-shared () {
+    if [[ "${1:-}" == "--shared" ]] ; then
+        SCVC_SHARED_TRACK=1
+        return 0
+    else
+        SCVC_SHARED_TRACK=0
+        return 1
+    fi
+}
+
+#######################################
+scvc-cmd-listCommands () {
+    set | grep "^${SCVC_CMD_PREFIX}" | sed -e "s,^${SCVC_CMD_PREFIX},,g" -e "s, () .*,,g" | sort
+}
+
+#######################################
+scvc-cmd-help () {
+    # Specific help:
+    if [[ -n "${1:-}" ]] ; then
+	# User asked for specific help..
+	local helpFuncName="scvc-help-${1}"
+	if set | grep -q "^$helpFuncName" ; then
+	    # Show help prologue:
+	    cat >&2 <<HELP_COMMAND_PROLOG
+Help command '$1':
+
+Usage:
+  # $SCRIPT_NAME $1 [...]
+
+HELP_COMMAND_PROLOG
+	    # Show specific help:
+	    $helpFuncName >&2
+	    # Yeah...
+	    return 0
+	else nsk-error "Unknown command '$1' !"
+	fi
+    fi
+    # General help:
+    cat >&2 <<HELP_HEAD
+
+This utility helps to manage system configuration files versioning.
+
+Usage:
+  # $SCRIPT_NAME [command] [commandArg0 [commandArg1 [commandArg2 ...]]]
+
+Where [command] can be one of those:
+HELP_HEAD
+    scvc-cmd-listCommands | sed -e "s,^,  ,g"
+    cat <<HELP_FOOT
+
+Try '$SCRIPT_NAME help [command]'... It might work...
+
+Examples:
+
+  Add .bashrc to the DB:
+  \$ $SCRIPT_NAME track ~/.bashrc
+
+  Do a local snapshot and revision:
+  \$ $SCRIPT_NAME snapshot
+
+  Update remote repository:
+  \$ $SCRIPT_NAME pushRepo
+
+  Do a 'full round' backup:
+  \$ $SCRIPT_NAME --batch snapAndPush
+
+You can set the variable SCVC_CONFIG_MODE to the following values:
+  root | system      : global system configuration (root user).
+  user               : user local configuration ().
+  auto               : try to guess using...
+        if user call -> user mode.
+        if root call -> user mode if user config found
+                        system mode if no user config found
+
+System wide configuration:  '$SCVC_SYSCONFIG_PATH'
+User configuration:         '$SCVC_USERCONFIG_PATH'
+
+HELP_FOOT
+}
+
+#######################################
+scvc-help-captainObvious () {
+    cat <<EOF
+Should be obvious... Isn't it ?
+EOF
+}
+
+#######################################
+scvc-help-shareable () {
+    cat <<EOF
+This command support the argument '--shared' in order to select the shared files instead of the host specific.
+
+That is, if you need to share scvc settings over several machines.
+
+(This is valid for track lists, and the snapshot RCs).
+EOF
+}
+
+###############################################################################
+# Command: editConfig
+#######################################
+scvc-help-editConfig () { scvc-help-captainObvious ; }
+
+#######################################
+scvc-cmd-editConfig () {
+    nsk-userEditFile "$CONFIG_PATH"
+}
+
+###############################################################################
+# Command: track
+#######################################
+scvc-help-track () {
+    cat <<EOF
+
+Add one or more files or directories to the tracking lists.
+
+EOF
+    scvc-help-shareable
+}
+
+#######################################
+scvc-cmd-track () {
+    local path
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    # Scan all arguments:
+    while [[ -n "${1:-}" ]] ; do
+	path="$( nsk-ensureAbsolutePath "$1" )"
+	shift
+	if [[ -d "$path" ]] ; then
+	    scvc-db-trackDirectory "$path"
+	elif [[ -f "$path" ]] ; then
+	    scvc-db-trackFile "$path"
+	else # Not found:
+	    echo "Warning: '$path' not found !" >&2
+	fi
+    done
+    # Automatically clean the lists:
+    (( !isAutoCheck )) || scvc-db-cleanTrackedLists \
+        || nsk-error "Post track clean failed !"
+}
+
+###############################################################################
+# Command: listTrackedFiles
+#######################################
+scvc-help-listTrackedFiles () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-listTrackedFiles () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        cat "$TRACK_SHARED_FILELIST"
+    else
+        cat "$TRACK_FILELIST"
+    fi
+}
+
+###############################################################################
+# Command: listTrackedDirectories
+#######################################
+scvc-help-listTrackedDirectories () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-listTrackedDirectories () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        cat "$TRACK_SHARED_DIRLIST"
+    else
+        cat "$TRACK_DIRLIST"
+    fi
+}
+
+###############################################################################
+# Command: listTracked
+#######################################
+scvc-help-listTracked () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-listTracked () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        cat "$TRACK_SHARED_FILELIST"
+        cat "$TRACK_SHARED_DIRLIST"
+    else
+        cat "$TRACK_FILELIST"
+        cat "$TRACK_DIRLIST"
+    fi
+}
+
+###############################################################################
+# Command: editTrackedFiles
+#######################################
+scvc-help-editTrackedFiles () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-editTrackedFiles () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        nsk-userEditFile "$TRACK_SHARED_FILELIST"
+    else
+        nsk-userEditFile "$TRACK_FILELIST"
+    fi
+}
+
+###############################################################################
+# Command: editTrackedDirectories
+#######################################
+scvc-help-editTrackedDirectories () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-editTrackedDirectories () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        nsk-userEditFile "$TRACK_SHARED_DIRLIST"
+    else
+        nsk-userEditFile "$TRACK_DIRLIST"
+    fi
+}
+
+###############################################################################
+# Command: editTracked
+#######################################
+scvc-help-editTracked () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-editTracked () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        nsk-userEditFile "$TRACK_SHARED_DIRLIST" "$TRACK_SHARED_FILELIST"
+    else
+        nsk-userEditFile "$TRACK_DIRLIST" "$TRACK_FILELIST"
+    fi
+}
+
+###############################################################################
+# Command: editRC
+#######################################
+scvc-help-editRC () { scvc-help-captainObvious ; scvc-help-shareable ; }
+
+#######################################
+scvc-cmd-editRC () {
+    scvc-ctx-load
+    if scvc-check-shared "${1:-}" ; then shift ; fi
+    if (( SCVC_SHARED_TRACK )) ; then
+        nsk-userEditFile "$SHARED_RC"
+    else
+        nsk-userEditFile "$HOST_RC"
+    fi
+}
+
+###############################################################################
+# Command: trackedCheck
+#######################################
+scvc-help-trackedCheck () {
+    cat <<EOF
+Check and clean the tracked objects lists.
+
+It removes duplicated references and broken
+links.
+
+EOF
+}
+
+#######################################
+scvc-cmd-trackedCheck () {
+    scvc-ctx-load
+    echo " * Checking and cleaning tracked lists..."
+    scvc-db-cleanTrackedLists
+}
+
+###############################################################################
+# Command: gcRepo
+#######################################
+scvc-help-gcRepo () {
+    cat <<EOF
+Call git gc --aggressive on the local repository.
+
+EOF
+}
+
+#######################################
+scvc-cmd-gcRepo () {
+    scvc-ctx-load
+    scvc-git-cmd gc --aggressive
+}
+
+###############################################################################
+# Command: addRemote [name] [remote-path/url]
+#######################################
+scvc-help-addRemote () {
+    cat <<EOF
+Add a remote repository.
+
+  addRemote [name] [remote-path/url]
+
+EOF
+}
+
+#######################################
+scvc-cmd-addRemote () {
+    local remoteName="$1"
+    local remoteUrl="$2"
+    scvc-ctx-load
+    scvc-git-cmd remote add "$remoteName" "$remoteUrl" || nsk-error "Couldn't add remote repository !"
+}
+
+###############################################################################
+# Command: editIgnore
+#######################################
+scvc-help-editIgnore () {
+    cat <<EOF
+Allow to edit the git ignore rules.
+
+There are two .gitignores important for
+a local database: the shared one, and
+the local host one. Both are opened
+by the user specified editor.
+
+EOF
+}
+
+#######################################
+scvc-cmd-editIgnore () {
+    scvc-ctx-load
+    nsk-userEditFile "$GIT_SHAREDIGNORE" "$GIT_LOCALIGNORE"
+}
+
+###############################################################################
+# Command: pushRepo
+#######################################
+scvc-help-pushRepo () {
+    cat <<EOF
+Push the working branch on the reference
+remote repository.
+
+EOF
+}
+
+#######################################
+scvc-cmd-pushRepo () {
+    scvc-ctx-load
+    (( isGitValidBranch )) || nsk-error "You must specify a working branch name ! (try # $SCRIPT_NAME editConfig)"
+    (( isGitValidRemote )) || nsk-error "You must reference a valid remote repository ! (try # $SCRIPT_NAME editConfig)"
+    scvc-git-cmd push "$SCVC_GIT_REMOTEREPONAME" "$SCVC_GIT_BRANCH" || nsk-error "Failed to push to remote repository !"
+}
+
+###############################################################################
+# Command: wipeRepo
+#######################################
+scvc-help-wipeRepo () {
+    cat <<EOF
+Wipe the complete git repository history.
+
+WARNING: You can't rollback this action !
+
+EOF
+}
+
+#######################################
+scvc-cmd-wipeRepo () {
+    isIgnoreGit=1
+    scvc-ctx-load
+    if [[ -d "$GIT_DIR" ]] ; then
+	cat >>/dev/tty <<WIPEWARNING
+WARNING: ALL HISTORY WILL BE WIPED !
+
+Press Ctrl-C to abort now !
+
+Or press ENTER to continue...
+WIPEWARNING
+	read -s
+	rm -r "$GIT_DIR" || nsk-error "Problem while trying to wipe the DB repository!"
+    else echo " ! No git repository found." >&2
+    fi
+}
+
+###############################################################################
+# Command: mergeHistory
+#######################################
+scvc-help-mergeHistory () {
+    cat <<EOF
+Merge an history segment...
+
+ <StartRev> <EndRev>
+
+WARNING:
+ * You can't rollback this action !
+ * It's unsafe if you share this server branch (shouldn't happen).
+ * It will lose ALL previous history states.
+
+In the context of one branch per machine, no branch
+merging, and continuous forward commit of changes, this
+operation *should* be considered as safe.
+
+REMINDER: this tool is aimed towards seasonned administration having
+full understanding and knowledge of what they are doing.
+
+EOF
+}
+
+#######################################
+scvc-cmd-mergeHistory () {
+    local mergeFromRev="$1" mergeToRev="$2"
+#    isIgnoreGit=1
+    scvc-ctx-load
+    if [[ -d "$GIT_DIR" ]] ; then
+	cat >>/dev/tty <<WIPEWARNING
+WARNING: PART TO ALL HISTORY WILL BE WIPED !
+
+Meging history from revision:
+  $mergeFromRev
+to revision:
+  $mergeToRev
+
+Press Ctrl-C to abort now !
+
+Or press ENTER to continue...
+WIPEWARNING
+	read -s
+        echo "WORK IN PROGRESS..." >&2
+
+        isBatchMode=1
+
+        # Create a working branch starting
+        # at the specified revision.
+        local workBranch="${SCVC_GIT_BRANCH}-work"
+        echo " * Preparing working branch..."
+        scvc-git-cmd branch -f "$workBranch" "$mergeFromRev" || nsk-error "Failed to create working branch."
+        scvc-git-cmd checkout "$workBranch" || nsk-error "Failed to checkoute working branch."
+
+#        # List all files contained in the target
+#        # revision and "checkout" them...
+#        git ls-tree --name-only -r "$mergeFromRev" \
+#            | while IFS= read eachFile ; do
+#            scvc-git-cmd checkout "$mergeFromRev" "$eachFile" \
+#                || nsk-error "Failed to acquire final revision of: '$eachFile'"
+#            # Add the file to index:
+#            #TODO: Check if the file has really changed
+#            # in between...
+#            # Or try a diff-tree ??
+#            scvc-git-cmd add "$eachFile"
+#        done
+
+        echo " * Merging revision ($mergeFromRev..$mergeToRev)..."
+        scvc-db-importDelta "$mergeFromRev" "$mergeToRev"
+#        scvc-git-cmd diff-tree --name-status -r "$mergeFromRev" "$mergeToRev" \
+#            | while IFS= read eachFile ; do
+#            curStatus="$( echo "$eachFile" | cut -f1 )"
+#            curPath="$( echo "$eachFile" | cut -f2- )"
+#            case "$curStatus" in
+#                'M'|'A')
+#                    scvc-git-cmd checkout "$mergeToRev" "$curPath" \
+#                        || nsk-error "Failed to acquire final revision of: '$curPath'"
+#                    scvc-git-cmd add "$curPath" || nsk-error "Failed to add file '$curPath'"
+#                    ;;
+#                'D')
+#                    scvc-git-cmd rm "$curPath" || nsk-error "Failed to remove file '$curPath'"
+#                    ;;
+#                *) nsk-error "Unknown diff status M" ;;
+#            esac
+#        done
+
+        # We should commit...
+        #tig status
+        scvc-db-commitVersion "Auto-Merged Revisions"
+
+        # Now append the queue...
+        echo " * Appending post revisions..."
+        echo "scvc-git-cmd rev-list \"$mergeToRev\"..\"$SCVC_GIT_BRANCH\""
+        scvc-git-cmd rev-list "$mergeToRev".."$SCVC_GIT_BRANCH" \
+            | head -n -1 | $TAC_CMD \
+            | while IFS= read eachRev ; do
+            # Cloning revision on the new branch:
+            echo " * Appending revision '$eachRev'..."
+            scvc-db-importDelta "$eachRev"
+            scvc-db-commitVersion "Post-merge clone"
+        done
+
+        # Now we should be able to apply the new branch:
+        echo " * Apply revision merge..."
+        local oldBranch="${SCVC_GIT_BRANCH}-old"
+        scvc-git-cmd branch -f "$oldBranch" "$SCVC_GIT_BRANCH" \
+            || nsk-error "Failed to create backup branch."
+        scvc-git-cmd branch -f "$SCVC_GIT_BRANCH" "$workBranch" \
+            || nsk-error "Failed to create new active branch."
+        scvc-git-cmd checkout "$SCVC_GIT_BRANCH" \
+            || nsk-error "Failed to activate branch: $SCVC_GIT_BRANCH"
+        scvc-git-cmd branch -d "$workBranch" \
+            || nsk-error "Failed to remove working branch."
+
+        # We force the remote branch:
+        # WARNING: THIS IS WHERE THINGS CAN BE BROKEN IF THE BRANCH
+        # IS USED ON ANOTHER MACHINE !!
+        #
+        # As we have strongly diverge from the repository version,
+        # we must first kill the remote branch before 'repushing'
+        # a fresh new one on the new path.
+        #
+        # We admit in our use case that it's valid to do this and
+        # as being the "master" source on this branch we own it
+        # and do what we want with it.
+        scvc-git-cmd push "$SCVC_GIT_REMOTEREPONAME" ":$SCVC_GIT_BRANCH" || nsk-error "Failed to remove remote branch on remote repository !"
+        scvc-git-cmd push "$SCVC_GIT_REMOTEREPONAME" "$SCVC_GIT_BRANCH" || nsk-error "Failed to push to remote repository !"
+
+    else echo " ! No git reposiory found." >&2
+    fi
+}
+
+###############################################################################
+# Command: snapshot
+#######################################
+scvc-help-snapshot () {
+    cat <<EOF
+This command is the more important: it
+makes a snapshot of the current tracked
+objects on the local host, and commit
+the changes to the git repository.
+
+EOF
+}
+
+#######################################
+scvc-cmd-snapshot () {
+    scvc-ctx-load
+    scvc-db-snapshotToCache
+    scvc-db-commitVersion
+}
+
+###############################################################################
+# Command: snapAndPush
+#######################################
+scvc-help-snapAndPush () {
+    cat <<EOF
+System snapshot and remote push.
+
+Usefull for batch call like cron jobs.
+
+EOF
+}
+
+#######################################
+scvc-cmd-snapAndPush () {
+    scvc-ctx-load
+    # Snapshot:
+    scvc-db-snapshotToCache
+    scvc-db-commitVersion
+    # And push:
+    (( isGitValidBranch )) || nsk-error "You must specify a working branch name ! (try # $SCRIPT_NAME editConfig)"
+    (( isGitValidRemote )) || nsk-error "You must reference a valid remote repository ! (try # $SCRIPT_NAME editConfig)"
+
+    if (( isGitVirgin )) ; then
+	# Remove remote branch in case...
+	scvc-git-cmd push "$SCVC_GIT_REMOTEREPONAME" :"$SCVC_GIT_BRANCH" || :
+    fi
+
+    scvc-git-cmd push "$SCVC_GIT_REMOTEREPONAME" "$SCVC_GIT_BRANCH" || nsk-error "Failed to push to remote repository !"
+}
+
+###############################################################################
+# SCVC Main entry point:
+###############################################################################
+
+# Quick'n'dirty argument parsing...
+if [[ -n "${1:-}" ]] ; then
+    while [[ -n "${1:-}" ]] ; do
+        curArg="$1" ; shift
+        case "$curArg" in
+            # Some switches:
+	    --help|-h) scvc-cmd-help "$@" ; break ;;
+	    --batch|-b) isBatchMode=1 ;;
+            --auto-check) isAutoCheck=1 ;;
+            --no-auto-check) isAutoCheck=0 ;;
+            --no-warn) isShowSecurityWarning=0 ;;
+            # Unknown switch:
+	    --*|-*) nsk-error "Unknown option '$curArg' !" ;;
+            # Other should be a command:
+	    *)  scvc-showBanner
+	        scvc-showSecurityWarning
+                if scvc-cmd-listCommands | grep -q "$curArg" &>/dev/null ; then
+                    "${SCVC_CMD_PREFIX}${curArg}" "$@"
+                else nsk-error "Invalid command: '$curArg'. (Try \$ $SCRIPT_NAME help )"
+                fi
+	        break
+	        ;;
+        esac
+    done
+else
+    # We don't really fail here, technically speaking...
+    # But we warn user, as we have nothing to be done
+    # so we expect a noob (*) and we present help.
+    # (*) Well I just realized, a year after, that a
+    # "noob" shouldn't use this tool anyway :).
+    scvc-showBanner
+    cat >&2 <<NOARG
+
+Warning: No command specified, nothing done !
+
+NOARG
+    scvc-cmd-help
+fi
+
+# Normal exit:
+exit 0
+
+# Congratulation: You sources down to the end ! ;)

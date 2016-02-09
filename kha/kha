@@ -1,0 +1,1693 @@
+#!/usr/bin/env bash
+#kha
+###############################################################################
+# KommandO Hack Assist - Garry Iglesias - garry.iglesias@gmail.com
+###############################################################################
+#
+# This tool aims to assist any "Hardkore CLI KommandO". In other terms, any
+# heavy command line power user, administrator, developer, hacker, hardkore
+# hobbyist, or simply what should be a real "computer user" :).
+#
+# But one of the requirements of a real "KommandO" is to be able to live in
+# hostile environments, with low resources, relying on few tools because of
+# the versatility of the environments he works on, and yet be able to have some
+# kind of portable "light weighted" Swiss-army knife, with a "tool box" that
+# can improve and carry an unified environment on many "numerical work-spaces"
+# spread on several "workstations".
+#
+# KHA doesn't really do the distributed side itself. But it helps the user to
+# automatize it, tweaking it to his needs. And on the core, it simply rely
+# on git. And for "HardKore KommandO" situations, it can "bake itself" when
+# possible to be able to be deployed on remote/freshly installed/offline
+# workstations.
+#
+# So KHA is simply an assistant for the command line user, a "shell extension"
+# and a common language and layout to keep your day to day and common tasks
+# easily accessible, and easily maintained.
+#
+# ----------------------------------------------------------------------------
+# Usage:
+#  $ kha [options] <kommand> [kommand-options] [kommand-args]
+#
+#  $ kha help
+#
+#  $ kha help <kommand>
+#
+# ----------------------------------------------------------------------------
+#  KHA Install:
+#    $ ./kha install-self [options]
+#
+#  With [options] being one or more of:
+#    --prefix <root-path>
+#    --global
+#    --local
+#    --sym-links
+#    --portable
+#    --with-plugins
+#    --no-plugin
+#    --run-setup
+#    --no-setup
+#
+# ----------------------------------------------------------------------------
+#  KHA Plugins Install:
+#    $ ./kha install-plugin [options]
+#
+#  With [options] being one or more of:
+#    --sym-links
+#    --run-setup
+#    --no-setup
+#
+#  KommanDEV install snippet:
+#    $ ./kha install-self --sym-links --with-plugins --run-setup
+#
+###############################################################################
+set -Cue
+
+###############################################################################
+# KHA's global Konstants:
+###############################################################################
+readonly KHA_VERSION='0.0.2'
+readonly KHA_LAYOUT_VERSION='0.1'
+
+###############################################################################
+# Running script magicks:
+###############################################################################
+readonly KHA_LAUNCH_DIR="$( pwd )"
+readonly KHA_NAME="$( basename "${0}" )"
+readonly KHA_DIR="$( cd "$( dirname "${0}" )" && pwd )"
+readonly KHA_PATH="${KHA_DIR}/${KHA_NAME}"
+readonly KHA_IS_ROOTUSER=$(( !UID ))
+
+###############################################################################
+# External commands lookups:
+###############################################################################
+sWhich () { which "$1" 2>>/dev/null ; }
+readonly LU_BASH="$(sWhich bash)"
+readonly LU_CAT="$(sWhich cat)"
+readonly LU_SED="$(sWhich sed)"
+readonly LU_GREP="$(sWhich grep)"
+readonly LU_AWK="$(sWhich awk)"
+readonly LU_SORT="$(sWhich sort)"
+readonly LU_READLINK="$(sWhich readlink)"
+
+###############################################################################
+# KommandO functions:
+###############################################################################
+#KTAG: KommandO SeKtion.
+
+#######################################
+# Low level, global flags:
+KHA_DEBUG_MODE=${KHA_DEBUG_MODE:-0}
+KHA_DEV_MODE=${KHA_DEV_MODE:-0}
+KHA_VERBOSE_MODE=${KHA_VERBOSE_MODE:-1}
+
+# The "DDV" Flag:
+if (( ${KHA_DDV:-0} )) ; then
+    KHA_DEBUG_MODE=1
+    KHA_DEV_MODE=1
+    KHA_VERBOSE_MODE=1
+fi
+
+# The "STFU" Flag:
+if (( ${KHA_STFU:-0} )) ; then
+    KHA_DEBUG_MODE=0
+    KHA_DEV_MODE=0
+    KHA_VERBOSE_MODE=0
+fi
+
+#######################################
+kha-ifVerbose () { (( !KHA_VERBOSE_MODE )) || "$@" ; }
+kha-ifDev () { (( !KHA_DEV_MODE )) || "$@" ; }
+kha-ifDebug () { (( !KHA_DEBUG_MODE )) || "$@" ; }
+
+#######################################
+kha-error-echo () { echo "$@" >&2 ; }
+kha-error-cat () { cat "$@" >&2 ; }
+kha-verbose-echo () { (( !KHA_VERBOSE_MODE )) || echo "$@" >&2 ; }
+kha-verbose-cat () { (( !KHA_VERBOSE_MODE )) || cat "$@" >&2 ; }
+kha-dev-echo () { (( !KHA_DEV_MODE )) || echo "$@" >&2 ; }
+kha-dev-cat () { (( !KHA_DEV_MODE )) || cat "$@" >&2 ; }
+kha-debug-echo () { (( !KHA_DEBUG_MODE )) || echo "$@" >&2 ; }
+kha-debug-cat () { (( !KHA_DEBUG_MODE )) || cat "$@" >&2 ; }
+
+#######################################
+kha-dumpStack () {
+    local frameSkipCount=${1:-0}
+    local nFrames=${#FUNCNAME[*]}
+    (( ++frameSkipCount ))
+    (( nFrames-- ))
+    if (( frameSkipCount < nFrames )) ; then
+        for i in $( seq $frameSkipCount $nFrames ) ; do
+            echo "[${FUNCNAME[$i]}] (${BASH_SOURCE[$i]}:${BASH_LINENO[$(( i - 1 ))]})"
+        done
+    fi
+}
+
+
+#######################################
+kha-error () {
+    kha-error-echo "ERROR[${FUNCNAME[1]}]:" "$@"
+    (( !KHA_DEV_MODE )) || kha-dumpStack 1 >&2
+    exit 1
+}
+
+#######################################
+kha-wip () {
+    kha-error-echo "[${FUNCNAME[1]}] Work in progress..." "$@"
+    (( !KHA_DEV_MODE )) || kha-dumpStack 1 >&2
+    exit 42
+}
+
+#######################################
+kha-ensureDir () {
+    if [[ -d "${1}" ]] ; then return 0
+    else
+	kha-verbose-echo " * Creating directory: '$1'."
+        mkdir -p "${1}"
+    fi
+}
+
+#######################################
+kha-ensureDirs () { for d ; do kha-ensureDir "${d}" ; done ; }
+
+#######################################
+kha-mkAbsDir () {
+    local absSrc
+    case "$2" in
+        '/'*) absSrc="$2" ;;
+        *) absSrc="$1/$2" ;;
+    esac
+    echo "$(cd "$absSrc" && pwd)"
+}
+
+#######################################
+kha-killKomments () { sed -e 's,#.*$,,g' -e 's, *,,g' | grep -v '^ *$' ; }
+
+#######################################
+kha-klobber () { [[ ! -f "$1" ]] || rm "$1" ; }
+
+#######################################
+kha-klobber-redirect () { [[ ! -f "$1" ]] || rm "$1" && cat >"$1" ; }
+
+#######################################
+kha-source-redirect () {
+    # Flush input:
+    local input
+    input="$(mktemp)"
+    cat >>"$input"
+    # Now klobber source with result:
+    mv "$input" "$1"
+}
+
+#######################################
+kha-redirect-notify-and-wait () {
+    cat >>'/dev/tty'    # Display the notify.
+    <'/dev/tty' read -s # Now wait for user to RETURN.
+}
+
+#######################################
+kha-edit () {
+    [[ -n "${EDITOR:-}" ]] || kha-error "Environment variable 'EDITOR' not defined !"
+    "${EDITOR}" "$@"
+}
+
+#######################################
+kha-mktemp () {
+    local newTmp
+    KHA_TMP_LIST="${KHA_TMP_LIST:-$(mktemp)}"
+    newTmp="$(mktemp "$@")"
+    echo "${newTmp}" >>"${KHA_TMP_LIST}"
+    echo "${newTmp}"
+}
+
+#######################################
+kha-flushTemps () {
+    if [[ -n "${KHA_TMP_LIST:-}" ]] ; then
+	local tmp
+	while IFS= read tmp ; do rm "${tmp}" ; done <"${KHA_TMP_LIST}"
+	rm "${KHA_TMP_LIST}"
+    fi
+    unset KHA_TMP_LIST
+}
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# KHommands:
+# KHA recognized function starting with a specific prefix (kmd-) and
+# automatically use them when invoked from command line (without the prefix).
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: Kommand MeKaniKs SeKtion.
+readonly KHA_KMD_PREFIX='kmd-'
+
+#######################################
+kha-listKommands () { set | grep "^${KHA_KMD_PREFIX}.*()" | sed -e "s,^${KHA_KMD_PREFIX},,g" -e 's, *().*$,,g' ; }
+kha-isKommand () { set | grep -q "^${KHA_KMD_PREFIX}${1} *(" ; }
+kha-exeK () {
+    local kmd="${KHA_KMD_PREFIX}${1}"
+    shift
+    "$kmd" "$@"
+}
+
+#######################################
+kmd-list-commands () { kha-listKommands ; }
+
+#######################################
+# Bare kommands are kommands that need
+# a "bare" environment, without trying
+# to load plugins or to do any of the
+# "bootstrap" extensions.
+KHA_BARE_KOMMAND_LIST="$(kha-mktemp)"
+kha-bareKommand () { echo "$1" >>"${KHA_BARE_KOMMAND_LIST}" ; }
+kha-isBare () { <"${KHA_BARE_KOMMAND_LIST}" grep -q "^$1\$" ; }
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# KHA Installation:
+# KHA can install itself... And more...
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: Installation Section.
+
+#######################################
+# Some defaults:
+readonly KHACTX_DEFAULT_PREFIX="${HOME}"
+#if (( KHA_INSTALL_GLOBAL )) ; then
+#    readonly KHACTX_DEFAULT_INSTALL_SETUP=0
+#else
+#    readonly KHACTX_DEFAULT_INSTALL_SETUP=1
+#fi
+#if (( KHA_IS_ROOTUSER )) ; then
+#    readonly KHACTX_DEFAULT_PREFIX="/"
+#else
+#    readonly KHACTX_DEFAULT_PREFIX="${HOME}"
+#fi
+
+#######################################
+# Installation flags:
+KHA_INSTALL_GLOBAL=${KHA_INSTALL_GLOBAL:-0}
+KHA_INSTALL_SYMLINKS=${KHA_INSTALL_SYMLINKS:-0}
+KHA_INSTALL_PORTABLE=${KHA_INSTALL_PORTABLE:-0}
+KHA_INSTALL_FACTORY_PLUGINS=${KHA_INSTALL_FACTORY_PLUGINS:-1}
+KHA_INSTALL_WITH_SETUP=${KHA_INSTALL_WITH_SETUP:-1}
+
+# Installation parameters:
+KHA_INSTALL_PREFIX="${KHA_INSTALL_PREFIX:-$KHACTX_DEFAULT_PREFIX}"
+
+#######################################
+kha-install-brief () {
+    kha-redirect-notify-and-wait <<INSTALL_BRIEF
+#######################################
+ KHA - Installation process.
+#######################################
+
+ We will proceed in KHA's installation
+now.
+
+Installation root:
+${KHA_INSTALL_PREFIX}
+
+Binary directory:
+${KHA_INSTALL_BIN_DIR}
+
+Press RETURN to proceed...
+INSTALL_BRIEF
+}
+
+#######################################
+kha-install-file () {
+    # Load parameters:
+    local src="$1" tgt="$2" oldtgt="$2.old"
+    kha-verbose-echo " * Installing file: ${tgt}"
+
+    # Check tgt directory:
+    local tgtDir
+    tgtDir="$(dirname "$tgt")"
+
+    [[ -d "$tgtDir" ]] || mkdir -p "$tgtDir" \
+	|| kha-error "Failed to create dir: '$tgtDir'"
+
+    # A "regular file" ?
+    if [[ -f "${tgt}" ]] ; then
+        cp -au "${tgt}" "${oldtgt}"   # Backup...
+        rm "${tgt}"                   # And remove it
+    fi
+
+    # A link ?
+    [[ ! -L "${tgt}" ]] || rm "${tgt}" # Simply kill it.
+
+    # Something else ?
+    [[ ! -e "${tgt}" ]] || kha-error "Target '${tgt}' cannot be clobered !"
+
+    # So which kind of installation do we do ?
+    if (( KHA_INSTALL_SYMLINKS )) ; then
+        ln -s "${src}" "${tgt}"
+    else
+        cp -a "${src}" "${tgt}"
+    fi
+
+    # Refresh backup timestamp:
+    if [[ ! -f "${oldtgt}" ]] ; then
+        usleep 1000
+        touch "${oldtgt}"
+    fi
+}
+
+#######################################
+kha-install-directory () {
+    # Load parameters:
+    local src="$1" tgt="$2" oldtgt="$2.old"
+    kha-verbose-echo " * Installing directory: ${tgt}"
+
+    # Source Check:
+    [[ -d "$src" ]] || kha-error "Missing source directory: ${src} !"
+
+    # Check target as directory:
+    [[ ! -d "$tgt" ]] || kha-error "Target directory already present !"
+
+    # Check "any" target:
+    [[ ! -e "$tgt" ]] || kha-error "Something is alreay present !"
+
+    # So which kind of installation do we do ?
+    if (( KHA_INSTALL_SYMLINKS )) ; then
+        ln -s "$src" "$tgt"
+    else
+        local tgtParent
+        tgtParent="$(dirname "$tgt" )"
+        cp -a "$src" "$tgtParent"
+    fi
+}
+
+#######################################
+kha-install-sanityCheck () {
+    # Global sanity checK:
+    (( !KHA_INSTALL_GLOBAL )) \
+        || (( KHA_IS_ROOTUSER )) \
+        || kha-error "Only 'root' user can do a global install for now..."
+
+    (( !KHA_INSTALL_GLOBAL )) \
+        || kha-wip "Global installation is not yet implemented."
+
+    # Portable vs SymLinks:
+    (( !KHA_INSTALL_SYMLINKS )) \
+        || (( !KHA_INSTALL_PORTABLE )) \
+        || kha-error "A Portable installation cannot use symbolic links !"
+
+    # Editor warning:
+    [[ -n "${EDITOR:-}" ]] \
+        || kha-error-echo "WARNING: Variable EDITOR is not defined in the environment !"
+}
+
+#######################################
+kha-run-self-install () {
+    # Some sanity checks:
+    kha-install-sanityCheck
+
+    # Build final internal install context:
+    KHA_INSTALL_BIN_DIR="${KHA_INSTALL_BIN_DIR:-$KHA_INSTALL_PREFIX/bin}"
+
+    # Notify / brief user:
+    kha-install-brief
+
+    # ================================
+    # Let's rock !
+    # ================================
+
+    # Install self:
+    local tgtSelf="${KHA_INSTALL_BIN_DIR}/${KHA_NAME}"
+    kha-install-file "${KHA_PATH}" "${tgtSelf}"
+
+    (( !KHA_INSTALL_WITH_SETUP )) \
+        || "${tgtSelf}" init \
+        || kha-error "KHA setup failed."
+
+    # Install factory plugins:
+    if (( KHA_INSTALL_FACTORY_PLUGINS )) ; then
+        # Check factory plugins root directory:
+        local pluginDir="${KHA_DIR}/plugins"
+        if [[ -d "${pluginDir}" ]] ; then
+            # List all plugins present:
+            local pluginList
+            pluginList="$(kha-mktemp)"
+            ( cd "${pluginDir}" && find -L . -type d -maxdepth 1 2>>'/dev/null' ) \
+                | cut -b3- | grep -v '^ *$' >>"$pluginList"
+            while IFS= read plugName ; do
+                kha-verbose-echo " * Requesting plugin '${plugName}' install..."
+                # Export some states for the sub-install process:
+                export \
+                    KHA_INSTALL_SYMLINKS \
+                    KHA_INSTALL_WITH_SETUP
+                # Call KHA to install the plugin:
+                "${tgtSelf}" install-plugin "${pluginDir}/${plugName}" \
+                    || kha-error "Failed to install plugin '${plugName}' !"
+            done <"$pluginList"
+        else kha-error "KHA didn't found any factory plugin at: '${pluginDir}'"
+        fi
+    fi
+}
+
+#######################################
+kha-plug-srcDB-plugExists () {
+    local srcPlgDB="$1" plugName="$2"
+    <"$srcPlgDB" grep -q "|${plugName}|"
+}
+
+#######################################
+kha-plug-srcDB-getPlugDir () {
+    local srcPlgDB="$1" plugName="$2"
+    local plugLine
+    plugLine="$(<"$srcPlgDB" grep "|${plugName}|" )"
+    if [[ -n "$plugLine" ]] ; then
+        local srcDir
+        srcDir="$(echo "$plugLine" | cut -d\| -f1 )"
+        echo "${srcDir}/${plugName}"
+    fi
+}
+
+#######################################
+kha-plug-depVisit () {
+    # Load plugin arguments:
+    local visitList="$1" srcPlgDB="$2" plugDir="$3" plugName
+    plugName="$(basename "$plugDir" )"
+
+    [[ -d "$plugDir" ]] || "Plugin directory not found: '${plugDir}'"
+
+    # First visit ?
+    if ! <"$visitList" grep -q "^${plugName}\$" ; then
+        # First visit here, so we mark it:
+        echo "$plugName" >>"$visitList"
+
+        # And dig for any dependency:
+        local plugDeps="${plugDir}/${KHACTX_PLG_DEPLIST_NAME}"
+        if [[ -f "$plugDeps" ]] ; then
+            local depName depDir
+            while IFS= read depName || [ -n "$depName" ] ; do
+                # Look up for dep directory:
+                depDir="$(kha-plug-srcDB-getPlugDir "$srcPlgDB" "$depName" )"
+                if [[ -n "$depDir" ]] ; then
+                    # Ok so we got it somewhere, at least...
+                    # so be it:
+                    kha-plug-depVisit "$visitList" "$srcPlgDB" "$depDir"
+                else
+                    # Unknown dep, so we can't walk in...
+                    # ...but we show it, we can't decide
+                    # here, master is master... :)
+                    echo "$depName" >>"$visitList"
+                fi
+            done <"$plugDeps"
+        fi
+    fi
+}
+
+#######################################
+kha-plug-linearInstall () {
+    local srcPlgDB="$1" installList="$2"
+    local plugName plugSrcDir
+    while IFS= read plugName ; do
+        # A new plugin ?
+        if kha-plug-exists "$plugName" ; then
+            kha-verbose-echo " * Plugin '${plugName}' already installed !"
+            #TODO: check if it is registered too...
+            #kha-plug-isRegistered
+        else
+            # Something new here !
+            plugSrcDir="$(kha-plug-srcDB-getPlugDir "$srcPlgDB" "$plugName" )"
+            plugTgtDir="${KHA_PLG_PATH}/${plugName}"
+
+            # So install it:
+            kha-install-directory "$plugSrcDir" "$plugTgtDir"
+
+            # And register it:
+            kha-plug-register "$plugName"
+        fi
+    done <"$installList"
+}
+
+#######################################
+kha-run-plug-install () {
+    local pluginList="$1"
+    # First we need to list plugins to
+    # install. This means looking for depen-
+    # dencies first... And that's means,
+    # building the sources path given
+    # "plugin database"
+
+    # Get all source dirs:
+    local srcPlgDB plugSrc srcDir
+    srcPlgDB="$(kha-mktemp)"
+    while IFS= read plugSrc ; do
+        srcDir="$(dirname "$plugSrc" )"
+        <"$srcPlgDB" grep -q "^${srcDir}|\$" \
+            || echo "${srcDir}|" >>"$srcPlgDB"
+    done <"$pluginList"
+
+    # List all plugins available in the sources:
+    local srcRec
+    while IFS= read srcRec ; do
+        srcDir="${srcRec%|}"
+        [[ -d "$srcDir" ]] || kha-error "Directory not found: '${srcDir}'"
+        printf '%s' "$srcRec"
+        ( cd "$srcDir" && find -L . -type d -maxdepth 1 ) \
+            | cut -b3- | grep -v '^ *$' \
+            | while IFS= read plugName ; do
+            printf '%s' "${plugName}|"
+        done
+        printf '\n'
+    done <"$srcPlgDB" | kha-source-redirect "$srcPlgDB"
+
+    # Now we can scan again the plugin list
+    # and look for dependencies, being able
+    # to "look up" the on in the provided
+    # source directories:
+    local installList plugName plugScript plugDeps depName
+    installList="$(kha-mktemp)"
+    while IFS= read plugSrc ; do
+        plugName="$(basename "$plugSrc" )"
+        plugScript="${plugSrc}/${KHACTX_PLG_SCRIPT_NAME}"
+
+        # Script sanity check:
+        [[ -f "$plugScript" ]] \
+            || kha-error "Plugin '${plugName}' is missing: '${plugScript}'"
+
+        # Dependency visit on this plugin:
+        kha-plug-depVisit "$installList" "$srcPlgDB" "$plugSrc"
+    done <"$pluginList"
+
+    # The install list is in 'descendant'
+    # order, so we need to reverse it:
+    #TODO: Make a func (or reuse) for the sed one-liner...
+    sed '1!G;h;$!d' "$installList" | kha-source-redirect "$installList"
+
+    # Now we can process to a linear "brute"
+    # installation:
+    kha-plug-linearInstall "$srcPlgDB" "$installList"
+}
+
+#######################################
+kmd-install-self () {
+    # Load arguments:
+    local curArg
+    while [[ -n "${1:-}" ]] ; do
+        curArg="$1" ; shift
+        case "${curArg}" in
+            '--prefix') KHA_INSTALL_PREFIX="$1" ; shift ;;
+            '--global') KHA_INSTALL_GLOBAL=1 ;;
+            '--local') KHA_INSTALL_GLOBAL=0 ;;
+            '--sym-links') KHA_INSTALL_SYMLINKS=1 ;;
+            '--portable') KHA_INSTALL_PORTABLE=1 ;;
+            '--with-plugins') KHA_INSTALL_FACTORY_PLUGINS=1 ;;
+            '--no-plugin') KHA_INSTALL_FACTORY_PLUGINS=0 ;;
+            '--run-setup') KHA_INSTALL_WITH_SETUP=1 ;;
+            '--no-setup') KHA_INSTALL_WITH_SETUP=0 ;;
+            *) kha-error "Unrecognized argument: '${curArg}'" ;;
+        esac
+    done
+
+    # Launch the installation:
+    kha-run-self-install
+}
+
+kha-bareKommand 'install-self'
+
+#######################################
+kha-install-plugin () {
+    # Load arguments:
+    local curArg plugList plugName
+    plugList="$(kha-mktemp)"
+    while [[ -n "${1:-}" ]] ; do
+        curArg="$1" ; shift
+        case "${curArg}" in
+            '--sym-links') KHA_INSTALL_SYMLINKS=1 ;;
+            '--run-setup') KHA_INSTALL_WITH_SETUP=1 ;;
+            '--no-setup') KHA_INSTALL_WITH_SETUP=0 ;;
+            *) # Plugin spec:
+                if [[ -d "${curArg}" ]] ; then
+                    if [[ -f "${curArg}/${KHACTX_PLG_SCRIPT_NAME}" ]] ; then
+                        plugName="$( basename "${curArg}" )"
+                        if ! kha-plug-exists "${plugName}" ; then
+                            echo "${curArg}" >>"${plugList}"
+                        else kha-error-echo "Plugin '${plugName}' already installed !"
+                        fi
+                    else kha-error "Directory is not a KHA plugin '${curArg}'."
+                    fi
+                else kha-error "Argument is not a KHA Plugin directory: '${curArg}'."
+                fi
+                ;;
+        esac
+    done
+
+    # Launch the installation:
+    kha-run-plug-install "${plugList}"
+}
+
+#######################################
+kmd-install-plugin () {
+    KHA_INIT_PLUGINS=0 ktx-exeK kha-install-plugin "$@"
+}
+
+kha-bareKommand 'install-plugin'
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# Configuration generation functions:
+# Here we got some code to generate the default configuration file:
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+
+#######################################
+ktx-gen-komment () {
+    cat <<KHA_KOMMENT
+#######################################
+# $1
+KHA_KOMMENT
+}
+
+#######################################
+ktx-gen-var () {
+    cat <<KTX_VAR
+$1='$( eval "echo \"\$$1\"" )'
+KTX_VAR
+}
+
+#######################################
+ktx-gen-xvar () {
+    cat <<KTX_VAR
+export $1='$( eval "echo \"\$$1\"" )'
+KTX_VAR
+}
+
+#######################################
+# Kha's default configuration:
+ktx-defaultConfig () {
+    # Emit header:
+    cat <<KHA_DEFAULT_CONFIG_HEADER
+# Kommando Hack Assistant configuration.
+# Garry Iglesias - 2014 - 2016.
+# This is interpreted as a BASH script configuration.
+#
+
+KHA_DEFAULT_CONFIG_HEADER
+
+    # Emit configurable variables
+    ktx-gen-komment 'User credentials:'
+    ktx-gen-var 'KHA_USER_NAME'
+    ktx-gen-var 'KHA_USER_EMAIL'
+
+    # Emit footer:
+    cat <<KHA_DEFAULT_CONFIG_FOOTER
+
+# End of kha configuration.
+KHA_DEFAULT_CONFIG_FOOTER
+}
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# Kha's repository settings:
+# This is the basic repositories settings.
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+
+#######################################
+# Kha static layout:
+readonly KHACTX_USER_REPO_NAME='.kha'
+readonly KHACTX_GLOBAL_REPO_NAME='kha-global'
+
+#######################################
+# Kha context layout:
+readonly KHACTX_USER_REPO_PATH="${HOME}/${KHACTX_USER_REPO_NAME}"
+readonly KHACTX_GLOBAL_REPO_PATH="/var/${KHACTX_GLOBAL_REPO_NAME}"
+
+#######################################
+# Determine default repository:
+if (( KHA_IS_ROOTUSER )) ; then
+    readonly KHACTX_DEFAULT_REPO="${KHACTX_USER_REPO_PATH}"
+else
+    readonly KHACTX_DEFAULT_REPO="${KHACTX_USER_REPO_PATH}"
+fi
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# Kontext functions:
+# All Global KHA Kontext support is here.
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: KHA's Kontext.
+
+#######################################
+# Kha environment:
+KHA_ROOT="${KHA_ROOT:-$KHACTX_DEFAULT_REPO}"
+KHA_INIT_PLUGINS=1
+
+#######################################
+# Kha Context Layout:
+readonly KHAKTX_CONFIG_NAME='kha.conf'
+readonly KHAKTX_BIN_DIR='/bin'
+readonly KHAKTX_ETC_DIR='/etc'
+readonly KHAKTX_VAR_DIR='/var'
+readonly KHAKTX_PLG_DIR='/plugins'
+readonly KHAKTX_RCD_DIR='/rc.d'
+readonly KHAKTX_RCD_STARTD_NAME='1.start.d'
+readonly KHAKTX_RCD_SHUTD_NAME='2.shut.d'
+readonly KHAKTX_PLG_REG_NAME='.registrar'
+
+#######################################
+ktx-start () {
+    # The -obvious- configuration file:
+    KHA_CONFIG_PATH="${KHA_ROOT}/${KHAKTX_CONFIG_NAME}"
+    # The basic directory layout:
+    KHA_BIN_PATH="${KHA_ROOT}${KHAKTX_BIN_DIR}"
+    KHA_ETC_PATH="${KHA_ROOT}${KHAKTX_ETC_DIR}"
+    KHA_VAR_PATH="${KHA_ROOT}${KHAKTX_VAR_DIR}"
+    KHA_PLG_PATH="${KHA_ROOT}${KHAKTX_PLG_DIR}"
+    KHA_RCD_PATH="${KHA_ROOT}${KHAKTX_RCD_DIR}"
+    # The yet unusued rc.d dirs... (Do I keep'em ?)
+    KHA_STARTD_PATH="${KHA_RCD_PATH}/${KHAKTX_RCD_STARTD_NAME}"
+    KHA_SHUTD_PATH="${KHA_RCD_PATH}/${KHAKTX_RCD_SHUTD_NAME}"
+    # The plugin registrar:
+    KHA_PLG_REG_PATH="${KHA_PLG_PATH}/${KHAKTX_PLG_REG_NAME}"
+}
+
+#######################################
+ktx-defConf () {
+    # Well user 'public credentials' is quite useful...
+    KHA_USER_NAME="${KHA_USER_NAME:-Unknown Kommando}"
+    KHA_USER_EMAIL="${KHA_USER_EMAIL:-no.mail@no.where.void}"
+}
+
+#######################################
+ktx-postConf () {
+    # We can find the composed signature useful too...
+    KHA_USER_SIGNATURE="${KHA_USER_SIGNATURE:-$KHA_USER_NAME <$KHA_USER_EMAIL>}"
+}
+
+#######################################
+ktx-close () {
+    unset \
+        KHA_CONFIG_PATH \
+        KHA_BIN_PATH KHA_ETC_PATH KHA_VAR_PATH KHA_PLG_PATH KHA_RCD_PATH \
+        KHA_STARTD_PATH KHA_SHUTD_PATH \
+	KHA_PLG_REG_PATH \
+        KHA_USER_NAME KHA_USER_EMAIL KHA_USER_SIGNATURE
+}
+
+#######################################
+ktx-loadConf () {
+    # Defaults:
+    ktx-defConf
+
+    # Sanity check:
+    if [[ -f "${KHA_CONFIG_PATH}" ]] ; then
+	# Load configuration:
+	source "${KHA_CONFIG_PATH}" || kha-error "Failed loading configuration: ${KHA_CONFIG_PATH}"
+
+	# Apply configuration:
+	ktx-postConf
+    else
+	kha-error-cat <<NO_CONF_ERROR
+Warning: KHA has not been configured yet.
+
+Try:
+  \$ ${KHA_NAME} init
+
+And more help:
+  \$ ${KHA_NAME} help
+  \$ ${KHA_NAME} help init
+
+NO_CONF_ERROR
+	kha-error "Missing configuration file: ${KHA_CONFIG_PATH}"
+    fi
+}
+
+#######################################
+ktx-load () {
+    # Context loading:
+    ktx-start
+    ktx-loadConf
+
+    # Plugins startup:
+#    (( !KHA_INIT_PLUGINS )) || kha-plug-startupRC
+}
+
+#######################################
+ktx-exeK () {
+    # Load command name:
+    local cmd="$1"
+    shift
+
+    # Load the Kontext:
+    ktx-load
+
+    # InvoKe the command:
+    local retValue=0
+    "${cmd}" "$@" || retValue=$?
+
+    # Clear Kontext:
+    ktx-close
+
+    # Farewell:
+    return ${retValue}
+}
+
+#######################################
+ktx-init () {
+    ktx-start
+    ktx-defConf
+
+    # Check repository directory layout:
+    kha-ensureDirs "${KHA_ROOT}" \
+        "${KHA_BIN_PATH}" \
+        "${KHA_ETC_PATH}" \
+        "${KHA_VAR_PATH}" \
+	"${KHA_PLG_PATH}" \
+        "${KHA_RCD_PATH}" \
+        "${KHA_STARTD_PATH}" \
+        "${KHA_SHUTD_PATH}"
+
+    # Check configuration:
+    if ! [[ -f "${KHA_CONFIG_PATH}" ]] ; then
+        kha-verbose-echo " * Generating new configuration file..."
+        ktx-defaultConfig >"${KHA_CONFIG_PATH}"
+        kha-edit "${KHA_CONFIG_PATH}"
+    fi
+
+    # Check plugins registrar:
+    if ! [[ -f "${KHA_PLG_REG_PATH}" ]] ; then
+	kha-verbose-echo " * Generating new plugin registrar..."
+	cat >"${KHA_PLG_REG_PATH}" <<KHA_PLG_REG_DEFAULT
+###############################################################################
+# KHA's plugins registrar:
+#-----------------------------------------------------------------------------
+# Syntax:
+# <Plugin Name>|<Plugin State>|
+# Plugin State can be one of: {0/-/1/x}
+# WARNING: The trailing pipe (|) is MANDATORY !
+#-----------------------------------------------------------------------------
+# Plugins hooks are run in the sequential order of the script.
+# Except for the 'exit hooks' that are run in reverse orders.
+###############################################################################
+KHA_PLG_REG_DEFAULT
+#repository|1|
+#repo-mirror|1|
+#plug-devel|1|
+#        kha-edit "${KHA_PLG_REG_PATH}"
+    fi
+}
+
+#######################################
+ktx-info () {
+    cat <<KHA_KONTEXT_INFO_HEAD
+#######################################
+ KHA-KONTEXT BRIEF:
+#######################################
+KHA_KONTEXT_INFO_HEAD
+    # Dump kontext:
+    ktx-gen-var 'KHA_ROOT'
+    ktx-gen-var 'KHA_BIN_PATH'
+    ktx-gen-var 'KHA_PLG_PATH'
+    ktx-gen-var 'KHA_PLG_REG_PATH'
+    ktx-gen-var 'KHA_RCD_PATH'
+    ktx-gen-var 'KHA_USER_NAME'
+    ktx-gen-var 'KHA_USER_EMAIL'
+    cat <<KHA_KONTEXT_INFO_FOOT
+#######################################
+ KHA-KONTEXT END.
+#######################################
+KHA_KONTEXT_INFO_FOOT
+}
+
+#######################################
+ktx-editConfig () { kha-edit "${KHA_CONFIG_PATH}" ; }
+
+#######################################
+ktx-editKHA () { kha-edit "${KHA_ROOT}/${1}" ; }
+
+#######################################
+ktx-khado () { ( cd "${KHA_ROOT}" && "$@" ) ; }
+
+###############################################################################
+# KHA Kontext CLI Interface:
+###############################################################################
+
+#######################################
+kmd-init () { ktx-init ; }
+kmd-edit-config () { ktx-exeK ktx-editConfig ; }
+kmd-edit-kha () { ktx-exeK ktx-editKHA "$1" ; }
+kmd-khado () { ktx-exeK ktx-khado "$@" ; }
+kmd-info () { ktx-exeK ktx-info ; }
+
+kha-bareKommand 'init'
+kha-bareKommand 'edit-config'
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# KHA GIT Repository:
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: The core git stuff...
+
+#######################################
+kha-git () { ( cd "${KHA_ROOT}" && git "$@" ) ; }
+
+#######################################
+kha-gitEditConfig () { kha-edit "${KHA_ROOT}/.git/config" ; }
+
+#######################################
+kmd-gitdo () { ktx-exeK kha-git "$@" ; }
+
+#######################################
+kmd-git-config () { ktx-exeK kha-gitEditConfig ; }
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# KHA's plugins system:
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG:Plugins
+
+###############################################################################
+# Plugins files default content:
+###############################################################################
+
+#######################################
+kha-plug-defaultLib () {
+    # Load plugin parameters:
+    local plugName="$1"
+    # Generate default:
+    cat <<PLUGIN_DEFAULT_CODE
+###############################################################################
+# KHA Plugin: '${plugName}'
+# Author: ${KHA_USER_SIGNATURE}
+###############################################################################
+#
+# This BASH script will be sourced on KHA initialization if his plugin is
+# activated.
+#
+###############################################################################
+#
+# The main flow of this script is sourced on KHA's initialization, so the
+# only imperative code should do initialization, if required.
+#
+# Generally, a plugin consist more of a library of functions, to enhance
+# the KHA features enriching the KHA's environment.
+#
+# It is easy to expose a new Command Line "Kommand" simply prefixing your
+# function with '${KHA_KMD_PREFIX}'.
+#
+###############################################################################
+# Developer notes:
+#
+# Performances / Resources:
+#  - it is better not to "bloat" environment when not needed. So if you provide
+# a large function library, provide "lazy loading" function to source external
+# files "on demand".
+#
+###############################################################################
+
+###############################################################################
+# KHA ${plugName} plugin library:
+###############################################################################
+
+###############################################################################
+# KHA ${plugName} Command Line Interface:
+###############################################################################
+# Kommands accessible directly as KHA's kommands on the CLI.
+
+#######################################
+# This is a simple "Kommand" sample.
+# It just shows some message.
+${KHA_KMD_PREFIX}test-${plugName}-1 () {
+    kha-verbose-cat <<KHA_PLUGIN_TEST_MESSAGE
+KHA Plugin ${plugName}'s Hello World !
+
+Exposing a command as a kha command is as simple
+as this ! :)
+
+If you do:
+  \$ ${KHA_NAME} help
+
+You'll see that this function is present and ready.
+
+KHA_PLUGIN_TEST_MESSAGE
+}
+
+#######################################
+# This is an often used pattern, to read
+# kommand arguments.
+${KHA_KMD_PREFIX}test-${plugName}-2 () {
+    local curArg isCmd=0
+    while [[ -n "\${1:-}" ]] ; do
+        curArg="\$1"
+        case "\${curArg}" in
+            '--a-flag') SOME_FLAG=1 ;;
+            '--a-param') SOME_PARAM="$1" ; shift ;;
+            'some-command') kha-wip "Some Command in the future..." ;;
+            *) kha-error "Invalid argument '\${curArg}' !" ;;
+        esac
+    done
+    (( isCmd )) || kha-error-cat <<ERROR_NO_ARG
+mirror command requires some active aguments in order to do something useful. :)
+
+Try:
+  \\\$ \${KHA_NAME} help test-${plugName}-2
+
+ERROR_NO_ARG
+}
+
+#######################################
+# Previous kommand run out of the full
+# KHA context (environment).
+# This function requires to be invoked
+# from within the KHA env.
+# IT IS NOT accessible from CLI...
+# (It should be in the previous section
+# of "internal library", but for the
+# tutorial' sake, it's here... :) ).
+${plugName}-test-3 () {
+    echo "The KHA's root is at: \${KHA_ROOT}"
+    [[ -z "\${1:-}" ]] || echo "Parameters:" "\$@"
+}
+
+#######################################
+# This function is accessible from the
+# CLI and it invokes the previous one
+# wrapped inside KHA's kontext.
+${KHA_KMD_PREFIX}test-${plugName}-2 () {
+    ktx-exeK ${plugName}-test-3 "\$@"
+}
+
+###############################################################################
+# KHA ${plugName} plugin initialization:
+###############################################################################
+
+#######################################
+#TODO: Some initialization code:
+
+PLUGIN_DEFAULT_CODE
+}
+
+###############################################################################
+# Plugins Function Library:
+###############################################################################
+
+#######################################
+# Plugin layout:
+readonly KHACTX_PLG_SCRIPT_NAME='kha-lib.sh'
+readonly KHACTX_PLG_DEPLIST_NAME='kha.deps'
+
+#######################################
+kha-plug-listAll () {
+    kha-debug-echo "KHA> Listing all plugins..."
+    ( cd "${KHA_PLG_PATH}" && find -L . -type d -maxdepth 1 2>>'/dev/null' ) \
+	| cut -b3- | grep -v '^ *$' || return 0
+#
+}
+
+#######################################
+# Plugin restrar:
+# <PlugName>|{0|1|x|-}
+kha-plug-regar () { [ ! -f "${KHA_PLG_REG_PATH}" ] ||  <"${KHA_PLG_REG_PATH}" kha-killKomments ; } # || kha-error "No registrar." ; }
+kha-plug-regRecord () { echo "$1|$2|" ; }
+kha-regRec-plugName () { echo "$1" | cut -d\| -f1 ; }
+kha-regRec-state () { echo "$1" | cut -d\| -f2 ; }
+
+readonly KHA_PLUG_STATUS_REGEXP='|[1x+*]|'
+kha-plug-listActives () { kha-plug-regar | grep "${KHA_PLUG_STATUS_REGEXP}" | cut -d\| -f1 ; }
+kha-plug-listInactives () { kha-plug-regar | grep -v "${KHA_PLUG_STATUS_REGEXP}" | cut -d\| -f1 ; }
+kha-plug-getRecord () { kha-plug-regar | grep "^${1}|" ; }
+kha-plug-isRegistered () { kha-plug-regar | grep -q "^${1}|" ; }
+
+#######################################
+#kha-plug-exists () { kha-plug-listAll | grep -q "^${1}\$" ; }
+kha-plug-exists () { [[ -d "${KHA_PLG_PATH}/${1}" ]] ; }
+
+#######################################
+kha-plug-status () {
+    # Scan the plugin registrar:
+    kha-plug-regar | (
+        activeCount=0
+        while IFS= read rec ; do
+            # Extract plugin informations:
+	    name="$( kha-regRec-plugName "${rec}" )"
+	    state="$( kha-regRec-state "${rec}" )"
+            # Reset some vars:
+            rank=-1
+            plgError=
+            # Check plugin existence:
+            if kha-plug-exists "$name" ; then # && exists=1 || exists=0
+                # Check plugin state:
+	        case "$state" in
+	            '-'|'0') status='[inactive]' ;;
+	            'x'|'1'|'+'|'*') status='[active]' ; rank=$(( ++activeCount )) ;;
+	            *) status='[Broken]' ; plgError="Invalid state: ${state}" ;;
+	        esac
+            else status="[MISSING]" ; plgError="Plugin is not present on file system"
+            fi
+            # Handle some error extra message:
+            [[ -n "${plgError:-}" ]] \
+                && xtra=" !! [Error: ${plgError}]" \
+                || xtra=
+            # Show status:
+            (( 0 <= rank )) \
+                && printf "%10s %02d '%s'%s\n" "$status" $rank "$name" "$xtra" \
+                || printf "%10s XX '%s'%s\n" "$status" "$name" "$xtra"
+        done
+        # Some global count summary:
+        echo "Number of active plugins: $activeCount"
+    )
+}
+
+#######################################
+kha-plug-envStart () {
+    local plugName="$1"
+    KHA_PLUG_NAME="${plugName}"
+    KHA_PLUG_DIR="${KHA_PLG_PATH}/${plugName}"
+    KHA_PLUG_SCRIPT_PATH="${KHA_PLUG_DIR}/${KHACTX_PLG_SCRIPT_NAME}"
+    KHA_PLUG_DEPLIST_PATH="${KHA_PLUG_DIR}/${KHACTX_PLG_DEPLIST_NAME}"
+}
+
+#######################################
+kha-plug-envEnd () {
+    unset KHA_PLUG_NAME KHA_PLUG_DIR KHA_PLUG_SCRIPT_PATH
+}
+
+#######################################
+kha-plug-envLoad () {
+    # Start the plugin environment:
+    local plugName="$1"
+    kha-plug-envStart "${plugName}"
+    # Sanity checks:
+    [[ -d "${KHA_PLUG_DIR}" ]] || kha-error "Plugin '${KHA_PLUG_NAME}' has no directory !"
+}
+
+#######################################
+kha-plug-register () {
+    # Load plugin name:
+    local plugName="${1:-}"
+    [[ -n "${plugName}" ]] || kha-error "Usage: ... <plugin-name>."
+
+    # Existing plugin ?
+    if kha-plug-exists "${plugName}" ; then
+        if kha-plug-isRegistered "${plugName}" ; then
+            kha-error "Plugin '${plugName}' is already registered."
+        else
+            kha-plug-regRecord "${plugName}" 0 >>"${KHA_PLG_REG_PATH}"
+        fi
+    else kha-error "Plugin '${plugName}' is unknown !"
+    fi
+}
+
+#######################################
+kha-plug-setState () {
+    # Load plugin name:
+    local plugName="${1:-}"
+    local plugState="${2:-}"
+    #[[ -n "${plugName}" ]] || kha-error "Usage: ... <plugin-name> <plugin-state>."
+    [[ -n "${plugState}" ]] || kha-error "Usage: ... <plugin-name> <plugin-state>."
+
+    # Check if we have some record:
+    if kha-plug-isRegistered "${plugName}" ; then
+        # Generate new record:
+        local newRecord
+        newRecord="$( kha-plug-regRecord "${plugName}" "${plugState}" )"
+
+        #TODO: We might want to "sed escape" the newRecord
+        # so no unwanted char becomes misinterpreted.
+        #Note: we handle 'file names' somehow, so the probability
+        # for :Real Koders: making trouble with file names is quite
+        # low. At least I expect that ;).
+
+        # Apply state change:
+        local newRegar
+        newRegar="$(kha-mktemp)"
+        <"${KHA_PLG_REG_PATH}" sed -e "s,^${plugName}|.*\$,${newRecord},g" >>"${newRegar}"
+        cp "${newRegar}" "${KHA_PLG_REG_PATH}"
+
+        # Done !
+    else kha-error "Plugin '${plugName}' is not registered."
+    fi
+}
+
+#######################################
+kha-plug-createDefaultPluginSources () {
+    # Load plugin directory:
+    local plugDir="$1"
+    local plugName="$(basename "$plugDir")"
+
+    # Anti-clobber sanity check:
+    [[ ! -d "${plugDir}" ]] \
+        || kha-error "A directory already exists at: $plugDir"
+    [[ ! -e "${plugDir}" ]] \
+        || kha-error "Location already used: $plugDir"
+
+    # Create plugin directory:
+    mkdir -p "${plugDir}"
+
+    # Create the plugin source:
+    local plugLibSh="${plugDir}/${KHACTX_PLG_SCRIPT_NAME}"
+    kha-plug-defaultLib "$plugName" >"$plugLibSh"
+
+    # Create the plugin dependency list:
+    local plugDepList="${plugDir}/${KHACTX_PLG_DEPLIST_NAME}"
+    cat >"$plugDepList" <<EMPTY_DEP_LIST
+EMPTY_DEP_LIST
+
+    # Edit plugin scripts:
+    kha-edit "$plugLibSh" "$plugDepList"
+}
+
+#######################################
+kha-plug-new () {
+    # Load plugin name:
+    local plugName="${1:-}" plugSrcPath="${2:-}"
+    [[ -n "${plugName}" ]] || kha-error "Usage: ... <plugin-name> [<source-path>]."
+
+    # Sanity check anti/klobber:
+    ! kha-plug-exists "${plugName}" \
+	|| kha-error "A plugin is already existing as: '${plugName}' !"
+
+    # Check is use requested an "offshore" source
+    # for the plugin.
+    if [[ -n "${plugSrcPath}" ]] ; then
+        # Source path -> Offshore source.
+        # We will just "symlink" in the KHA
+        # tree.
+        local dirName="$(basename "$plugSrcPath")"
+
+        # Name sanity check:
+        [[ "$dirName" == "$plugName" ]] \
+            || kha-error "Offshore directory name doesn't match plugin's one."
+
+        # Create the offshore plugin sources:
+        kha-plug-createDefaultPluginSources "${plugSrcPath}"
+
+        # And installs it "symbolic linked":
+        kha-install-plugin --sym-links "${plugSrcPath}"
+    else
+        # No source path -> creates directly
+        # inside the active KHA plugin tree.
+
+        # Start environment with that plugin:
+        kha-plug-envStart "${plugName}"
+
+        # Generate plugin defaults:
+        kha-plug-createDefaultPluginSources "${KHA_PLUG_DIR}"
+
+        # Close plugin environment for post creation registration.
+        kha-plug-envEnd
+
+        # Register the plugin:
+        kha-plug-register "${plugName}"
+    fi
+}
+
+#######################################
+kha-plug-editRC () {
+    # Load plugin name:
+    local plugName="${1:-}"
+    [[ -n "${plugName}" ]] || kha-error "Usage: ... <plugin-name>."
+
+    # Is is a valid plugin ?
+    if kha-plug-exists "${plugName}" ; then
+
+        # Load Plugin environment:
+        kha-plug-envLoad "${plugName}"
+
+        # Edit plugin:
+        kha-edit "${KHA_PLUG_SCRIPT_PATH}"
+
+        # Shut plugin environment:
+        kha-plug-envEnd
+
+    else kha-error "Unknown plugin '${plugName}' !"
+    fi
+}
+
+#######################################
+kha-plug-fetchIt () {
+    local plugName="${1}"
+
+    kha-debug-echo "KHA> Fetching plugin '${plugName}'..."
+
+    # Load Plugin environment:
+    kha-plug-envLoad "${plugName}"
+
+    # Source plugin:
+    source "${KHA_PLUG_SCRIPT_PATH}" || kha-error "Failed to load plugin: '${plugName}' !"
+
+    echo "$plugName" >>"$KHA_RC_CHECKPOINT"
+
+    # Shut plugin environment:
+    kha-plug-envEnd
+}
+
+#######################################
+kha-plug-fetchThem () {
+    local plugList="${1}"
+    local eachPlug
+    while IFS= read eachPlug ; do
+	kha-plug-fetchIt "${eachPlug}"
+    done <"${plugList}"
+}
+
+#######################################
+kha-plug-startupRC () {
+    # Debug dump status:
+    # ( kha-plug-status ; kha-plug-listActives ) | sed -e 's,^,PLUGINIT> ,g'
+
+    # Check for multiple starts:
+    [[ -z "${KHA_STARTED_RCS:-}" ]] || kha-error "Plugins started twice !"
+
+    # List the plugins of interest:
+    kha-debug-echo "KHA> List active plugins..."
+    KHA_STARTED_RCS="$(kha-mktemp)"
+    KHA_RC_CHECKPOINT="$(kha-mktemp)"
+    kha-plug-listActives >>"${KHA_STARTED_RCS}"
+    #<"${KHA_STARTED_RCS}" sed -e 's,^,KHA/PLG> ,g'
+
+    # Fetch active plugins:
+    kha-debug-echo "KHA> Fetching active plugins..."
+    kha-plug-fetchThem "${KHA_STARTED_RCS}"
+
+    kha-debug-echo "KHA> Active plugins loaded."
+}
+
+#######################################
+kha-plug-shutdownRC () {
+    if [[ -n "${KHA_STARTED_RCS:-}" ]] ; then
+        # Clean environment:
+        rm "${KHA_STARTED_RCS}" "${KHA_RC_CHECKPOINT}"
+        unset KHA_STARTED_RCS KHA_RC_CHECKPOINT
+    fi
+}
+
+#######################################
+kha-plug-editRegar () {
+    kha-edit "${KHA_PLG_REG_PATH}"
+}
+
+#######################################
+# Invoked by plugins to check if dependencies
+# are present:
+kha-requirePlugins () {
+    local plugName
+    for plugName ; do
+        <"$KHA_RC_CHECKPOINT" grep -q "^${plugName}\$" \
+            || kha-error "Require plugin '${plugName}' !"
+    done
+}
+
+###############################################################################
+# KHA - Plugins CLI Kommands:
+###############################################################################
+kmd-list-plugins () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-listAll | sort ; }
+kmd-plugin-status () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-status ; }
+kmd-new-plugin () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-new "$@" ; }
+kmd-edit-registrar () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-editRegar ; }
+kmd-register-plugin () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-register "$@" ; }
+kmd-set-plugin-state () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-setState "$@" ; }
+kmd-edit-plugin () { KHA_INIT_PLUGINS=0 ktx-exeK kha-plug-editRC "$@" ; }
+
+#TODO: Implement The Future...
+kmd-pack-plugins () { kha-wip "The Future..." ; }
+#kmd-install-plugins () { kha-wip "The Future..." ; }
+kmd-list-unregistered-plugins () { kha-wip "The Future..." ; }
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# KHA Interactive session:
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: Interactive seKtion...
+# (Heavily work in progress).
+
+#######################################
+KHA_PROMPT="KHA> "
+KHI_ECHO=1
+
+#######################################
+kha-showPrompt () {
+    kha-verbose-echo "WARNING: Interactive mode is in early \"work in progress\" !"
+    printf "%s" "${KHA_PROMPT:-KHA\$ }"
+}
+
+#######################################
+kmd-shell () {
+    local kxpress
+    while kha-showPrompt ; read kxpress ; do
+        (( !KHI_ECHO )) || echo "kha Xpress = '${kxpress}'" >&2
+        case "${kxpress}" in
+            'exit'|'quit') return 0 ;;
+            *) kha-error-echo "Syntax error!" ;;
+        esac
+    done
+}
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# KHA Subshell session:
+# Subshell session is a way to get into some KHA environment.
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: Subshell SeKtion.
+
+#######################################
+KHA_SUBBANNER="${KHA_SUBBANNER:-0}"
+KHA_SUBSHELL="${KHA_SUBSHELL:-${LU_BASH}}"
+
+#######################################
+kha-generateSubShellInitRC () {
+    local ssLevel
+    ssLevel=$(( 1 + KHA_SS_LEVEL ))
+
+    # Generate the init rc head:
+    cat <<KHA_SUBSHELL_INIT_RC_HEAD
+###############################################################################
+# KHA SUBSHELL ENVIRONMENT STARTUP:
+###############################################################################
+readonly KHA_SS_LEVEL=${ssLevel}
+export KHA_SS_LEVEL
+KHA_SUBSHELL_INIT_RC_HEAD
+
+    # Send environment:
+    ktx-gen-komment 'KHA Values:'
+    ktx-gen-xvar 'KHA_BIN_PATH'
+    ktx-gen-xvar 'KHA_RCD_PATH'
+    ktx-gen-xvar 'KHA_STARTD_PATH'
+    ktx-gen-xvar 'KHA_SHUTD_PATH'
+    ktx-gen-komment 'User credentials:'
+    ktx-gen-xvar 'KHA_USER_NAME'
+    ktx-gen-xvar 'KHA_USER_EMAIL'
+
+    # Do a banner display:
+    (( !KHA_SUBBANNER )) || cat <<KHA_SUBSHELL_INIT_RC_BANNER
+#######################################
+# Print a banner:
+cat <<KHA_BANNER
+#######################################
+ KHA SUBSHELL #\${KHA_SS_LEVEL}
+#######################################
+KHA_BANNER
+KHA_SUBSHELL_INIT_RC_BANNER
+
+    # The core kha library functions:
+    cat <<KHA_SUBSHELL_INIT_RC_LIB
+#######################################
+# Embedded core kha functions:
+#######################################
+kha-level () { echo "\${KHA_SS_LEVEL}" ; }
+kha-stringContains () { [[ "\${1}" =~ "*\${2}*" ]] ; }
+isInPath () { kha-stringContains "\${PATH}" "\${1}" ; }
+KHA_SUBSHELL_INIT_RC_LIB
+
+    # Close kha init:
+    cat <<KHA_SS_RC_FOOTER
+#######################################
+echo "PATH was: \$PATH"
+export PATH="${KHA_BIN_PATH}:\${PATH}"
+export PS1='KHA[${ssLevel}]\\u@\\h\\w\\n\\\$ '
+echo "PATH is: \$PATH"
+
+KHA_SS_RC_FOOTER
+}
+
+#######################################
+kha-enterSubShell () {
+    # Setup environment:
+    kha-verbose-echo " * Preparing subshell environment..."
+#    export PATH="${KHA_BIN_PATH}:${PATH}"
+#    export PROMPT="KHA\$"
+
+    KHA_SS_LEVEL=${KHA_SS_LEVEL:-0}
+#    export KHA_SS_LEVEL=$(( ++KHA_SS_LEVEL ))
+    local ssInitRC
+    ssInitRC="$(mktemp)"
+    kha-generateSubShellInitRC >>"${ssInitRC}"
+
+    # Kommander review:
+    kha-edit "${ssInitRC}"
+
+    # Execute subshell:
+    kha-verbose-echo " * Entering subshell: ${KHA_SUBSHELL} #${KHA_SS_LEVEL}"
+    #exec "${KHA_SUBSHELL}" --norc
+    "${KHA_SUBSHELL}" --rcfile "${ssInitRC}" || kha-error "Subshell failed !"
+    #--init-file "${}" --norc
+    kha-verbose-echo " * Returning from subshell: ${KHA_SUBSHELL} #${KHA_SS_LEVEL}"
+}
+
+#######################################
+kmd-enter () { ktx-exeK kha-enterSubShell "$@" ; }
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# Help:
+# KHA's help system.
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+#KTAG: Help SeKtion.
+
+#######################################
+kmd-help () {
+    cat <<KHELP_HEADER
+Usage:
+
+  \$ ${KHA_NAME} [options] <Kommand> [command arguments]
+
+List of global options:
+  --[no-]verbose
+    Enable [or disable] verbose mode.
+
+  --no-plugin
+    Disable any plugin for this run.
+
+  --[no-]debug
+    Enable [or disable] debug mode.
+
+  --[no-]development
+    Enable [or disable] development mode.
+
+List of available Kommands:
+KHELP_HEADER
+    kha-listKommands | sort | sed -e 's,^,    ,'
+    cat <<KHELP_FOOTER
+
+Try:
+  $ ${KHA_NAME} help <kommand-name>
+  (Note: not all Kommands are documented)
+
+KHELP_FOOTER
+}
+
+###############################################################################
+# ----------------------------------------------------------------------------
+#
+# Parsing command line arguments:
+#
+# ----------------------------------------------------------------------------
+###############################################################################
+
+#######################################
+kha-fetch-plugins () {
+    if (( KHA_INIT_PLUGINS )) ; then
+        #kha-exeK kha-plug-startupRC
+        ktx-start
+        kha-plug-startupRC
+        ktx-close
+    fi
+}
+
+#######################################
+kha-eval-cl () {
+    local curArg xecRet
+    while [[ -n "${1:-}" ]] ; do
+        curArg="$1" ; shift
+        case "${curArg}" in
+            # =======================================
+            # Some global flags:
+            '--debug') KHA_DEBUG_MODE=1 ;;
+            '--verbose') KHA_VERBOSE_MODE=1 ;;
+            '--development') KHA_DEV_MODE=1 ;;
+            '--no-debug') KHA_DEBUG_MODE=0 ;;
+            '--no-verbose') KHA_VERBOSE_MODE=0 ;;
+            '--no-development') KHA_DEV_MODE=0 ;;
+            '--no-plugin') KHA_INIT_PLUGINS=0 ;;
+            # =======================================
+            '--help'|'-h'|'help') # Crying for some help ?
+                kha-fetch-plugins
+                xecRet=0
+		curArg='help' # Force arg for 'help'.
+                kha-exeK "${curArg}" "$@" || xecRet=$?
+
+                # Shut plugins:
+                kha-plug-shutdownRC
+                exit 0
+                ;;
+            # =======================================
+            # Unknown optional argument:
+            -*) kha-error "Error: Invalid argument '${curArg}' !" ;;
+            # =======================================
+            *)  # A general argument:
+                # We need to fetch plugins BEFORE
+                # looking up for Kommand name.
+                kha-isBare "${curArg}" \
+                    || kha-fetch-plugins
+
+                # Do we know that kommand ?
+                if kha-isKommand "${curArg}" ; then
+                    # Run it !
+                    xecRet=0
+                    kha-exeK "${curArg}" "$@" || xecRet=$?
+
+                    # Shut plugins:
+                    kha-plug-shutdownRC
+
+                    # And leave:
+                    exit ${xecRet}
+                else
+                    kha-error-cat <<INVALID_KOMMAND
+Error: Unrecognized Kommand '${curArg}' !
+Try: \$ ${KHA_NAME} help
+INVALID_KOMMAND
+#                    kha-listKommands
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # We had nothing to do...
+    kha-error-cat <<KHA_NO_KOMMAND_ERROR
+Nothing to be done.
+
+Try: \$ ${KHA_NAME} help
+
+KHA_NO_KOMMAND_ERROR
+
+    # Doing nothing is not an error itself...
+    return 0
+}
+
+#######################################
+# Hey, this is the 'actual entry point' !
+kha-eval-cl "$@"
+
+# And the exit point... :)

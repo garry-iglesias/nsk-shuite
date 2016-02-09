@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+###############################################################################
+# NoStress Kommando Git Change Logger - Garry Iglesias (c) 2016.
+# ----------------------------------------------------------------------------
+#
+# ----------------------------------------------------------------------------
+#
+###############################################################################
+set -Cue
+
+###############################################################################
+# It's a kind of magick...
+###############################################################################
+readonly LAUNCH_DIR="$(pwd)"
+readonly SCRIPT_NAME="${0##*/}"
+
+###############################################################################
+# KCHLOG - parameters.
+###############################################################################
+
+KCHLOG_LOG_FILENAME="${KCHLOG_LOG_FILENAME:-ChangeLog.txt}"
+KCHLOG_NO_REV_UPDATE=${KCHLOG_NO_REV_UPDATE:-0}
+
+###############################################################################
+# KommandO functions:
+###############################################################################
+
+#######################################
+nsk-error () { echo "ERROR:" "$@" >&2 ; exit 1 ; }
+
+#######################################
+debug-echo () { (( !KUSLACK_DEBUG )) || echo "$@" ; }
+debug-cat () { (( !KUSLACK_DEBUG )) || "$LU_CAT" "$@" ; }
+verbose-echo () { (( !KUSLACK_VERBOSE )) || echo "$@" ; }
+verbose-cat () { (( !KUSLACK_VERBOSE )) || "$LU_CAT" "$@" ; }
+
+echo-err () { echo "$@" >&2 ; }
+cat-err () { cat "$@" >&2 ; }
+
+
+###############################################################################
+# KCHLOG - Context:
+###############################################################################
+
+######################################
+readonly KCHLOG_LASTREV_SUFFIX='.rev'
+readonly KCHLOG_DATE_FORMAT='+%Y - %b %d [%H:%M]'
+
+######################################
+kchlog-ctx-init () {
+    local logDir="$1" gitRoot
+    # Ensure that we point to a directory.
+    if [[ -d "$logDir" ]] ; then
+	# Make sure it's absolute;
+	logDir="$(cd "$logDir" && pwd)"
+	gitRoot="$(kchlog-lookupGitRoot "$logDir")"
+	# Did we found a git repository?
+	if [[ -n "$gitRoot" ]] ; then
+	    # And build the environment context:
+	    KCHLOG_GIT_DIR="$gitRoot"
+	    KCHLOG_INNER_DIR="${logDir#$gitRoot}"
+	    KCHLOG_CHANGELOG="$logDir/$KCHLOG_LOG_FILENAME"
+	    KCHLOG_LASTREV="$logDir/.${KCHLOG_LOG_FILENAME}${KCHLOG_LASTREV_SUFFIX}"
+
+	    # Remove leading slash:
+	    [[ "$KCHLOG_INNER_DIR" != '/'* ]] || KCHLOG_INNER_DIR="${KCHLOG_INNER_DIR:1}"
+
+	    # Debug dump...
+	    #kchlog-ctx-dump
+	else nsk-error "Specified path is not inside a git repository: '$logDir'"
+	fi
+    else nsk-error "Specified path is not a directory: '$logDir'"
+    fi
+}
+
+######################################
+kchlog-ctx-dump () {
+    cat-err <<ENV_DUMP
+KCHLOG_GIT_DIR='$KCHLOG_GIT_DIR'
+KCHLOG_INNER_DIR='$KCHLOG_INNER_DIR'
+KCHLOG_CHANGELOG='$KCHLOG_CHANGELOG'
+KCHLOG_LASTREV='$KCHLOG_LASTREV'
+ENV_DUMP
+}
+
+######################################
+kchlog-ctx-shut () {
+    unset KCHLOG_CHANGELOG KCHLOG_LASTREV KCHLOG_INNER_DIR KCHLOG_GIT_DIR
+}
+
+###############################################################################
+# Some git feats.
+###############################################################################
+
+######################################
+kchlog-git () { local gitCmd="$1" ; shift ; ( cd "$KCHLOG_GIT_DIR" && git "$gitCmd" "$@") ; }
+
+######################################
+kchlog-lookupGitRoot () {
+    local baseDir curDir
+    baseDir="$(cd "$1" && pwd)"
+    curDir="$baseDir"
+    while [[ -n "$curDir" ]] && [[ ! -d "$curDir/.git" ]]
+    do curDir="${curDir%/*}"
+    done
+    [[ -n "$curDir" ]] \
+	&& echo "$curDir" \
+	    || nsk-error "Not inside a git repository: '$baseDir'"
+}
+
+###############################################################################
+# The actual changelog updater:
+###############################################################################
+
+######################################
+kchlog-updateLog () {
+    local newLog gitLog
+    newLog="$(mktemp)"
+    gitLog="$(mktemp)"
+
+    # Generate the git log for the revision range:
+    local revRange inPath
+    [[ -n "$KCHLOG_REV_LAST" ]] \
+	&& revRange="$KCHLOG_REV_LAST..$KCHLOG_REV_CURRENT" \
+	    || revRange="$KCHLOG_REV_CURRENT"
+    [[ -n "$KCHLOG_INNER_DIR" ]] \
+	&& inPath="$KCHLOG_INNER_DIR" \
+	    || inPath='.'
+    #echo-err ">> Inner path='$inPath'"
+    kchlog-git log -m --decorate=no \
+	       "$revRange" \
+	       "$inPath" \
+	       >>"$gitLog"
+
+    # Create the tag banner:
+    cat >>"$newLog" <<LOG_TAGBANNER
+# $(date "$KCHLOG_DATE_FORMAT")
+###############################################################################
+LOG_TAGBANNER
+
+    # Append raw git-log...
+    echo "Contributors:" >>"$newLog"
+    grep -e '^Author' "$gitLog" \
+	 | sed -e 's,Author: ,  ,g' \
+	 | sort -u \
+		>>"$newLog"
+    cat >>"$newLog" <<LOG_HISTORY_HEAD
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+         - GIT log history -
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+LOG_HISTORY_HEAD
+    grep -v \
+	 -e '^Author' \
+	 -e 'Signed-off-by' \
+	 "$gitLog" \
+	 >>"$newLog"
+
+    # Edit the new log...
+    [[ -z "$EDITOR" ]] || "$EDITOR" "$newLog"
+
+    # Append original log...
+    if [[ -f "$KCHLOG_CHANGELOG" ]] ; then
+	echo "#<------------------------------------>" >>"$newLog"
+	cat "$KCHLOG_CHANGELOG" >>"$newLog"
+    fi
+
+    # Review log:
+    #less "$newLog"
+
+    # Apply log:
+    [[ ! -f "$KCHLOG_CHANGELOG" ]] || rm "$KCHLOG_CHANGELOG"
+    cp "$newLog" "$KCHLOG_CHANGELOG"
+
+    # Store revision:
+    if (( !KCHLOG_NO_REV_UPDATE )) ; then
+	[[ ! -f "$KCHLOG_LASTREV" ]] || rm "$KCHLOG_LASTREV"
+	echo "$KCHLOG_REV_CURRENT" >"$KCHLOG_LASTREV"
+    fi
+
+    # Clean temps:
+    rm "$newLog" "$gitLog"
+}
+
+###############################################################################
+# KCHLOG - Top-level commands:
+###############################################################################
+
+######################################
+kchlog-help () {
+    cat <<KCHLOG_HELP
+Usage:
+  \$ ${SCRIPT_NAME} [options] <command> [args] ...
+
+Where <command> can be:
+  help, -h, --help
+      This help screen.
+
+  update [/path/to/change/log]
+      Update the specified Change Log.
+
+KCHLOG_HELP
+}
+
+######################################
+kchlog-update () {
+    local path="${1:-$LAUNCH_DIR}"
+    kchlog-ctx-init "$path"
+
+    # Load repo branch and revision:
+    KCHLOG_BRANCH="$(kchlog-git branch | grep '* ' | cut -b3-)"
+    echo " * Working on branch [$KCHLOG_BRANCH]."
+    KCHLOG_REV_CURRENT="$(kchlog-git show-ref -s --heads "$KCHLOG_BRANCH")"
+    echo " * Logging revision [${KCHLOG_REV_CURRENT:0:8}..]."
+    [[ -f "$KCHLOG_LASTREV" ]] \
+	&& KCHLOG_REV_LAST="$(cat "$KCHLOG_LASTREV")" \
+	    || KCHLOG_REV_LAST=
+
+    if [[ "$KCHLOG_REV_LAST" != "$KCHLOG_REV_CURRENT" ]] ; then
+	# Do the changelog update:
+	kchlog-updateLog
+    else echo-err " ! No change to log !"
+    fi
+    kchlog-ctx-shut
+}
+
+###############################################################################
+# Entry Point - Parse command line:
+###############################################################################
+
+######################################
+while [[ -n "${1:-}" ]] ; do
+    curArg="$1" ; shift
+    case "$curArg" in
+	'help'|'-h'|'--help') kchlog-help "$@" ; exit 0 ;;
+	'update') kchlog-update "$@" ; break ;;
+	*) nsk-error "Invalid argument '$curArg'." ;;
+    esac
+done

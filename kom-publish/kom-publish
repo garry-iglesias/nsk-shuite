@@ -1,0 +1,914 @@
+#!/usr/bin/env bash
+#kom-publish
+###############################################################################
+# Kommando Repository Publisher - Git-Repository "Digest" Publisher.
+#-----------------------------------------------------------------------------
+# This tool help to support "sub-repository", or "digest", or "cherry-picked"
+# portion of a repository to 'publish' a new revision on a "publishing repo".
+#
+# Basic Use Case:
+#   A private (restricted) repository is used for the core dev team.
+#   A public (ie: github) repository is used to expose revisions of a
+# set of files in the private repository.
+#
+#-----------------------------------------------------------------------------
+# (c) Garry Iglesias - 2015-2016.
+###############################################################################
+set -Cue
+
+#######################################
+# Some magicks
+readonly SCRIPT_LAUNCH_DIR="$(pwd)"
+readonly SCRIPT_NAME="${0##*/}"
+readonly SCRIPT_DIR="$(cd "${0%/*}" && pwd)"
+readonly SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+###############################################################################
+# Kommando Publisher - Environment Parameters:
+###############################################################################
+
+#######################################
+KPUB_DEBUG=${KPUB_DEBUG:-0}
+KPUB_VERBOSE=${KPUB_VERBOSE:-0}
+KPUB_IGNORE_SOURCE_REV=${KPUB_IGNORE_SOURCE_REV:-0}
+KPUB_CREATE_LOCAL_TARGET=${KPUB_CREATE_LOCAL_TARGET:-0}
+
+###############################################################################
+# Kommando Publisher - "System" functions:
+###############################################################################
+
+#######################################
+kpub-error () { echo "$@" >&2 ; exit 1 ; }
+
+#######################################
+echo-error () { echo "$@" >&2 ; }
+cat-error () { cat "$@" >&2 ; }
+
+#######################################
+kpub-callArgs () {
+    local fn="$1" dir
+    shift
+    for dir ; do "$fn" "$dir" ; done
+}
+
+#######################################
+kpub-checkDir () {
+    [[ -d "$1" ]] || mkdir -p "$1" \
+	|| kpub-error "KPUB: Couldn't create directory: '$1'"
+}
+
+#######################################
+kpub-rmDir () {
+    [[ ! -d "$1" ]] || rm -rf "$1" \
+	|| kpub-error "KPUB: Couldn't remove directory: '$1'"
+}
+
+#######################################
+kpub-resetDir () {
+    [[ ! -d "$1" ]] || rm -rf "$1" \
+	|| kpub-error "KPUB: Couldn't reset (remove) directory: '$1'"
+    mkdir -p "$1" || kpub-error "KPUB: Couldn't reset (create) directory: '$1'"
+}
+
+#######################################
+kpub-rmFile () {
+    [[ ! -f "$1" ]] || rm "$1" \
+	|| kpub-error "KPUB: Couldn't remove file: '$1'"
+}
+
+#######################################
+kpub-resetFile () {
+    [[ ! -f "$1" ]] || rm "$1" \
+	|| kpub-error "KPUB: Couldn't reset file: '$1'"
+    touch "$1"
+}
+
+#######################################
+kpub-checkFile () { [[ -f "$1" ]] || touch "$1" ; }
+
+#######################################
+kpub-checkDirs () { kpub-callArgs kpub-checkDir "$@" ; }
+kpub-rmFiles () { kpub-callArgs kpub-rmFile "$@" ; }
+
+#######################################
+kpub-absPath () { [[ "$2" == /* ]] && echo "$2" || echo "${1}/${2}" ; }
+kpub-effPath () { ( cd "$1" && pwd ) ; }
+
+#######################################
+kpub-unhashComment () { sed -e 's,#.*$,,g' ; }
+kpub-unemptyLines () { grep -v '^[ \t]*$' ; }
+kpub-cleanSource () { kpub-unhashComment | kpub-unemptyLines ; }
+
+#######################################
+kpub-git-branchRef () { cd "$1" && git show-ref -s --heads "$2" ; }
+
+#######################################
+kpub-git () {
+    local where="$1" what="$2"
+    shift 2
+    ( cd "$where" && git "$what" "$@" )
+}
+
+###############################################################################
+# Kommando Publisher - Context:
+###############################################################################
+
+#######################################
+readonly KPUB_CONF_NAME='kpub.conf'
+readonly KPUB_TAB_NAME='kpub.tab'
+readonly KPUB_EVENTAB_NAME='kpub.events'
+readonly KPUB_CACHE_NAME='cache'
+readonly KPUB_CACHESRC_NAME='src'
+readonly KPUB_CACHETGT_NAME='tgt'
+
+#######################################
+kpub-context () {
+    # Auto-magick root directory:
+    local rootDir="$1"
+    [[ -n "$rootDir" ]] || rootDir="${SCRIPT_LAUNCH_DIR}"
+    [[ "$rootDir" == /* ]] || rootDir="${SCRIPT_LAUNCH_DIR}/${rootDir}"
+    # Now build the context:
+    KPUB_ROOT_DIR="${rootDir}"
+    KPUB_NAME="${rootDir##*/}"
+    KPUB_CONF_PATH="${rootDir}/${KPUB_CONF_NAME}"
+    KPUB_TAB_PATH="${rootDir}/${KPUB_TAB_NAME}"
+    KPUB_EVENTAB_PATH="${rootDir}/${KPUB_EVENTAB_NAME}"
+    KPUB_CACHE_DIR="${rootDir}/${KPUB_CACHE_NAME}"
+}
+
+#######################################
+kpub-projAbsDirPath () {
+    # Check directory presence using the 'dirty' path:
+    local rawAbs
+    rawAbs="$(kpub-absPath "${KPUB_ROOT_DIR}" "$1")"
+    kpub-checkDir "$rawAbs"
+
+    # Now we are sure that a directory is present,
+    # get the 'clean effective path':
+    kpub-effPath "$rawAbs"
+}
+
+
+#######################################
+kpub-contextFinalize () {
+    # Sanity check configuration:
+    [[ -n "$KPUB_TRACK_REMOTE_REPOSITORY" ]] \
+	|| kpub-error "KPUB: Missing configuration variable KPUB_TRACK_REMOTE_REPOSITORY"
+    [[ -n "$KPUB_TRACK_BRANCH" ]] \
+	|| kpub-error "KPUB: Missing configuration variable KPUB_TRACK_BRANCH"
+    [[ -n "$KPUB_PUBLISH_REMOTE_REPOSITORY" ]] \
+	|| kpub-error "KPUB: Missing configuration variable KPUB_PUBLISH_REMOTE_REPOSITORY"
+    [[ -n "$KPUB_PUBLISH_BRANCH" ]] \
+	|| kpub-error "KPUB: Missing configuration variable KPUB_PUBLISH_BRANCH"
+
+    # Post-process configured environment:
+    KPUB_CACHE_DIR="$(kpub-projAbsDirPath "$KPUB_CACHE_DIR")"
+    KPUB_LOCAL_TARGET_REMOTE_SRC="${KPUB_LOCAL_TARGET_REMOTE_SRC:-}"
+    KPUB_TRIM_BASE="${KPUB_TRIM_BASE:-}"
+    KPUB_COMMIT_MESSAGE_DIFF_EXTRACT="${KPUB_COMMIT_MESSAGE_DIFF_EXTRACT:-}"
+
+    # And build the complete environment with definitive values:
+    KPUB_CACHESRC_DIR="${KPUB_CACHE_DIR}/${KPUB_CACHESRC_NAME}"
+    KPUB_CACHESRC_TRACKREV="${KPUB_CACHE_DIR}/${KPUB_CACHESRC_NAME}.track"
+    KPUB_CACHETGT_DIR="${KPUB_CACHE_DIR}/${KPUB_CACHETGT_NAME}"
+    KPUB_CACHE_EVENTDB="${KPUB_CACHE_DIR}/events.db"
+    KPUB_CACHE_TRACKDB="${KPUB_CACHE_DIR}/track.db"
+    KPUB_CACHE_PUBLISHDB="${KPUB_CACHE_DIR}/publish.db"
+
+    # Export sub-process environment:
+    export KPUB_SNAPSHOT_ROOT="$KPUB_CACHETGT_DIR"
+}
+
+#######################################
+kpub-contextLayout () {
+    kpub-checkDirs "$KPUB_CACHE_DIR"
+}
+
+#######################################
+kpub-contextShut () {
+    unset KPUB_ROOT_DIR KPUB_NAME \
+	KPUB_CONF_PATH KPUB_TAB_PATH KPUB_EVENTAB_PATH \
+	KPUB_CACHE_DIR \
+	KPUB_CACHESRC_DIR KPUB_CACHESRC_TRACKREV \
+	KPUB_CACHETGT_DIR \
+	KPUB_CACHE_EVENTDB \
+	KPUB_CACHE_TRACKDB KPUB_CACHE_PUBLISHDB
+}
+
+#######################################
+kpub-contextLoad () {
+    # Get kpub project root directory:
+    local rootDir="$1"
+    [[ -n "$rootDir" ]] || rootDir="${SCRIPT_LAUNCH_DIR}"
+    [[ "$rootDir" == /* ]] || rootDir="$(kpub-effPath "${SCRIPT_LAUNCH_DIR}/${rootDir}")"
+    if [[ -d "$rootDir" ]] ; then
+	# Build base context:
+	kpub-context "$rootDir"
+
+	# Load configuration:
+	if [[ -f "$KPUB_CONF_PATH" ]] ; then
+	    source "$KPUB_CONF_PATH"
+
+	    # And finalize context:
+	    kpub-contextFinalize
+	else kpub-error "KPUB: Not a Kommando Publisher project: '$rootDir'"
+	fi
+    else kpub-error "KPUB: Not a directory: '$rootDir'"
+    fi
+}
+
+###############################################################################
+# Kommando Publisher - Configuration:
+###############################################################################
+
+#######################################
+kpub-genDefaultConfig () {
+    cat <<KPUB_DEFAULT_CONF
+###############################################################################
+# Kommando Publisher Configuration File. - ${KPUB_NAME}
+###############################################################################
+
+#######################################
+# Cache directory:
+#KPUB_CACHE_DIR='cache'
+#KPUB_CACHE_DIR="\${HOME}/to/some/path"
+
+#######################################
+# Source Remote repository:
+KPUB_TRACK_REMOTE_REPOSITORY='ssh://user.name@server/path/to/repo.git'
+
+#######################################
+# Branch to track:
+KPUB_TRACK_BRANCH='to-publish'
+
+#######################################
+# Publishing Remote repository:
+KPUB_PUBLISH_REMOTE_REPOSITORY='ssh://user.name@server/path/to/repo.git'
+#KPUB_PUBLISH_REMOTE_REPOSITORY="\${HOME}/repos/publish-repo-name.git"
+
+#######################################
+# Do we force target repo creation ?
+# Uncomment this line of the publishing
+# repo is local and you want to create
+# it anyway...
+#KPUB_CREATE_LOCAL_TARGET=1
+
+#######################################
+# In case of missing local target and
+# KPUB_CREATE_LOCAL_TARGET is set, the
+# local publishing repository can be
+# cloned from another public repository
+# which can be usefull as a 'buffer'
+# before publishing to something like
+# github.
+#KPUB_LOCAL_TARGET_REMOTE_SRC='git@github.com:github-username/git-repo.git'
+
+#######################################
+# Branch to publish to:
+KPUB_PUBLISH_BRANCH='published'
+
+#######################################
+# Publishing commit message can be
+# compiled from a "diff" on a specified
+# file (ie: ChangeLog.txt).
+#KPUB_COMMIT_MESSAGE_DIFF_EXTRACT='ChangeLog.txt'
+
+#######################################
+# Specify a 'path to trim' while publishing.
+#KPUB_TRIM_BASE='path/to/be/trimmed'
+KPUB_DEFAULT_CONF
+}
+
+#######################################
+kpub-genDefaultTab () {
+    cat <<KPUB_DEFAULT_TAB
+###############################################################################
+# Kommando Publisher Repo Tab - ${KPUB_NAME}
+###############################################################################
+
+# Add relative path to objects to publish:
+path/to/some/publishable
+
+KPUB_DEFAULT_TAB
+}
+
+#######################################
+kpub-genDefaultEventab () {
+    cat <<KPUB_DEFAULT_EVENTAB
+###############################################################################
+# Kommando Publisher Event Tab - ${KPUB_NAME}
+###############################################################################
+# Syntax:
+# <Event-name>|<path/to/script>
+# A relative path is originated from publisher project's root directory.
+###############################################################################
+# List of available events:
+#
+# onBeforeSnapshot : called before doing a snapshot on the source repo.
+# Can be used to generate some dynamic content with full source available
+# before the snapshot digest.
+#
+# onAfterSnapshot : called after snapshot is done. Should be used to 'alter'
+# or 'patch' the snapshot for pulishing.
+#
+# onVerifySnapshot : called to verify snapshot validity for publishing. Must
+# be used to check if nothing undisclosed is published in the snapshot, or
+# to verify/test snapshot sources.
+#
+# onPrePublish : called just before publishing a valid snapshot. Can be used
+# to finalize snapshot with some tags, or to record a published version.
+#
+# onPostPublish : called after the new version is published.
+#
+###############################################################################
+
+# Examples:
+#onBeforeSnapshot|events/beforeSnapshot
+#onAfterSnapshot|events/afterSnapshot
+#onVerifySnapshot|events/verify
+#onPrePublish|events/prePublish
+#onPostPublish|events/postPublish
+KPUB_DEFAULT_EVENTAB
+}
+
+#######################################
+kpub-genDefaultGitIgnore () {
+    cat <<KPUB_DEFAULT_TAB
+###############################################################################
+# Kommando Publisher gitignore rules - ${KPUB_NAME}
+###############################################################################
+
+# Some temps:
+*~
+
+# Publishing cache directory:
+#WARNING: Be sure this matches the KPUB_CACHE_DIR variable, if you
+# override it in the configuration file.
+/${KPUB_CACHE_NAME}/
+
+KPUB_DEFAULT_TAB
+}
+
+#######################################
+kpub-checkConfFile () {
+    local filePath="$1" defaultGen="$2"
+    if [[ ! -f "$filePath" ]] ; then
+	echo " * Generating file: ${filePath}"
+	"$defaultGen" >"$filePath"
+	[[ -z "$EDITOR" ]] || "$EDITOR" "$filePath"
+    fi
+}
+
+#######################################
+kpub-init () {
+    # Create base directory if not exist:
+    local rootDir="${1:-}"
+    kpub-context "$rootDir"
+    kpub-checkDir "$KPUB_ROOT_DIR"
+
+    # And reload with the effective directory:
+    rootDir="$(kpub-effPath "$KPUB_ROOT_DIR")"
+    kpub-context "$rootDir"
+
+    # Now we can generate files:
+    kpub-checkConfFile "$KPUB_CONF_PATH" kpub-genDefaultConfig
+    kpub-checkConfFile "$KPUB_TAB_PATH" kpub-genDefaultTab
+    kpub-checkConfFile "$KPUB_EVENTAB_PATH" kpub-genDefaultEventab
+    kpub-checkConfFile "${rootDir}/.gitignore" kpub-genDefaultGitIgnore
+}
+
+#######################################
+kpub-cacheInit () {
+    kpub-rmFiles "$KPUB_CACHE_TRACKDB" "$KPUB_CACHE_EVENTDB"
+
+    # Clean snapshot tab:
+    <"$KPUB_TAB_PATH" kpub-cleanSource >"$KPUB_CACHE_TRACKDB"
+
+    # Clean event tab:
+    [[ -f "$KPUB_EVENTAB_PATH" ]] \
+	&& <"$KPUB_EVENTAB_PATH" kpub-cleanSource >"$KPUB_CACHE_EVENTDB" \
+	|| touch "$KPUB_CACHE_EVENTDB"
+}
+
+###############################################################################
+# Kommando Publisher - Event Tab:
+###############################################################################
+
+#######################################
+kpub-eventThrow () {
+    local eventName="$1" eventRecord ; shift
+    local traceEvent=0
+    (( !traceEvent )) || echo "EVENT{${eventName}}" "$@" >&2
+    # Get event record:
+    eventRecord="$(<"$KPUB_CACHE_EVENTDB" grep -e "^${eventName}|" || : )"
+    (( !traceEvent )) || echo "Event record: '${eventRecord}'" >&2
+    if [[ -n "$eventRecord" ]] ; then
+	# Extract script path:
+	local eventScript="${eventRecord#*|}" absPath
+	absPath="$(kpub-absPath "$KPUB_ROOT_DIR" "$eventScript")"
+	if [[ -x "$absPath" ]] ; then
+	    # Execute event handler script:
+	    if "$absPath" "$@" ; then return 0
+	    else return 1
+	    fi
+	else kpub-error "KPUB: Invalid event callback: '${eventScript}'."
+	fi
+    else return 0 # No callback -> so always OK.
+    fi
+}
+
+###############################################################################
+# Kommando Publisher - Tracking Tab:
+###############################################################################
+
+#######################################
+kpub-trackFileList () {
+    local eTracked srcPath
+    while IFS= read eTracked ; do
+	#TODO: We should support wildcards and more
+	# advanced "selection" way. In the future... :)
+	case "$eTracked" in
+	    '*') # This is the "take all" sugar wildcard.
+		( cd "$KPUB_CACHESRC_DIR" && find . -type f 2>>/dev/null || : ) \
+		    | grep -v '/.git/'
+		;;
+	    *) # This is an explicit cherry pick...
+		srcPath="${KPUB_CACHESRC_DIR}/${eTracked}"
+		if [[ -f "$srcPath" ]] ; then echo "$eTracked"
+		elif [[ -d "$srcPath" ]] ; then
+		    ( cd "$KPUB_CACHESRC_DIR" && find "$eTracked" -type f 2>>/dev/null || : )
+		else echo "KPUB: Tracked source not found: '${eTracked}'" >&2
+		fi
+		;;
+	esac
+    done <"$KPUB_CACHE_TRACKDB" | sort -u
+}
+
+#######################################
+kpub-trackSnapshot() {
+    echo " * Taking snapshot..."
+    
+    # Before Snapshot Event:
+    ( cd "$KPUB_CACHESRC_DIR" && kpub-eventThrow 'onBeforeSnapshot' )
+
+    # Generate the snapshot file list:
+    local srcFileList
+    srcFileList="$(mktemp)"
+    kpub-trackFileList >>"$srcFileList"
+
+    # Now process files:
+    local eTracked srcPath tgtPath tgtDir tgtRel
+    while IFS= read eTracked ; do
+	#echo "Publishing: ${eTracked}" >&2
+	srcPath="${KPUB_CACHESRC_DIR}/${eTracked}"
+	[[ -n "$KPUB_TRIM_BASE" ]] \
+	    && tgtRel="${eTracked##${KPUB_TRIM_BASE}/}" \
+	    || tgtRel="$eTracked"
+	tgtPath="${KPUB_CACHETGT_DIR}/${tgtRel}"
+	tgtDir="${tgtPath%/*}"
+	kpub-checkDir "$tgtDir"
+	#TODO: Filter files...
+	cp -a "$srcPath" "$tgtPath"
+    done <"$srcFileList"
+    rm "$srcFileList"
+
+    # After Snapshot Event:
+    ( cd "$KPUB_CACHETGT_DIR" && kpub-eventThrow 'onAfterSnapshot' ) \
+	|| kpub-error "KPUB: Failed to process after snapshot !"
+
+    # Verify Snapshot Event:
+    ( cd "$KPUB_CACHETGT_DIR" && kpub-eventThrow 'onVerifySnapshot' ) \
+	|| kpub-error "KPUB: Invalid snapshot for publishing !"
+}
+
+###############################################################################
+# Kommando Publisher - Publishing Process:
+###############################################################################
+
+#######################################
+# Clone or "pull" a git repository.
+kpub-syncGitRepo () {
+    local rootDir="$1" repoName="$2" remoteRepo="$3" branchName="$4"
+    local localDir="${rootDir}/${repoName}"
+    if [[ -d "$localDir" ]] ; then
+	echo-error " * Pulling remote [$repoName]..."
+	cd "$localDir" \
+	    && git fetch \
+	    && git checkout "$branchName" \
+	    && git merge --ff-only "origin/${branchName}" \
+	    || kpub-error "Failed to pull remote repository: ${repoName}@${remoteRepo}/${branchName}"
+    else
+	# The remote repository might not have the requested branch...
+	# So we first check it:
+	local remoteRefs
+	remoteRefs="$(git ls-remote "$remoteRepo" 2>/dev/null)"
+	if <<<"$remoteRefs" grep -q "heads/$branchName\$" &>/dev/null
+	then # Remote branch exists...
+	    echo-error " * Cloning remote [$repoName]..."
+	    cd "$rootDir" \
+		&& git clone -b "$branchName" "$remoteRepo" "$repoName" \
+		    || kpub-error "Failed to clone remote: ${remoteRepo}/${branchName}."
+	else # Remote branch is missing...
+	    # We still clone the repo...
+	    echo-error " * Cloning remote [$repoName]..."
+	    cd "$rootDir" \
+		&& git clone "$remoteRepo" "$repoName" \
+		    || kpub-error "Failed to clone remote: ${remoteRepo}."
+	    # But we must create the local branch from
+	    # default HEAD:
+	    echo-error " * Creating local branch [$repoName/$branchName]..."
+	    cd "$localDir" \
+	       && git checkout -b "$branchName" \
+		   || kpub-error "Failed to create local branch: ${branchName}."
+	fi
+    fi
+}
+
+#######################################
+kpub-resetWorkingTree () {
+    local wtPath="$1" objList eObj
+    echo " * Resetting working tree: '$wtPath'"
+    objList="$(mktemp)"
+    #echo " * Generating genocide list..."
+    ( cd "$wtPath" && find . -mindepth 1 -maxdepth 1 2>/dev/null || : ) \
+	| cut -b3- | grep -v "^.git\$" >>"$objList" || :
+    #echo " * Final solution..."
+    local absPath
+    while IFS= read eObj ; do
+	absPath="${wtPath}/${eObj}"
+	if [[ -d "$absPath" ]] ; then rm -rf "$absPath"
+	elif [[ -f "$absPath" ]] ; then rm -f "$absPath"
+	else echo "KPUB: Ignored unknown '$eObj'" >&2
+	fi
+    done <"$objList"
+    rm "$objList"
+}
+
+#######################################
+# PUBLISH - Source Cache:
+#######################################
+
+#######################################
+kpub-syncSrcCache () {
+    echo " * Synchronizing tracking repository..."
+
+    # Clone or 'pull' the remote source:
+    kpub-syncGitRepo "$KPUB_CACHE_DIR" "$KPUB_CACHESRC_NAME" \
+	"$KPUB_TRACK_REMOTE_REPOSITORY" "$KPUB_TRACK_BRANCH"
+
+    # Get current head revision:
+    KPUB_SRC_HEADREV="$(kpub-git-branchRef "$KPUB_CACHESRC_DIR" "$KPUB_TRACK_BRANCH")"
+}
+
+#######################################
+# PUBLISH - Source Tracking:
+#######################################
+
+#######################################
+kpub-trackSrcCache () {
+    [[ -f "$KPUB_CACHESRC_TRACKREV" ]] \
+	&& KPUB_SRC_LASTREV="$(cat "$KPUB_CACHESRC_TRACKREV")" \
+	|| KPUB_SRC_LASTREV=""
+    [[ "$KPUB_SRC_LASTREV" == "$KPUB_SRC_HEADREV" ]] || newContent=1
+    (( !KPUB_IGNORE_SOURCE_REV )) || newContent=1
+}
+
+#######################################
+# PUBLISH - Target Cache:
+#######################################
+
+#######################################
+kpub-syncTgtCache () {
+    echo " * Synchronizing publishing repository..."
+
+    # Local repository, we can create it,
+    # if it is missing...
+    if [[ "$KPUB_PUBLISH_REMOTE_REPOSITORY" == /* ]] ; then
+	# Is it missing ?
+	if [[ ! -d "$KPUB_PUBLISH_REMOTE_REPOSITORY" ]] ; then
+	    echo-error "KPUB: Publishing repo not found: ${KPUB_PUBLISH_REMOTE_REPOSITORY}"
+	    # The target publishing repo is not found.
+	    # Do we need to create it automatically ?
+	    if (( KPUB_CREATE_LOCAL_TARGET )) ; then
+		if [[ -n "$KPUB_LOCAL_TARGET_REMOTE_SRC" ]] ; then
+		    echo-error "KPUB: Cloning remote source for local publishing..."
+		    local rootDir="${KPUB_PUBLISH_REMOTE_REPOSITORY%/*}"
+		    local repoName="${KPUB_PUBLISH_REMOTE_REPOSITORY##*/}"
+		    mkdir -p "$rootDir" \
+			&& cd "$rootDir" \
+			&& git clone --bare --shared "$KPUB_LOCAL_TARGET_REMOTE_SRC" "$repoName" \
+			    || kpub-error "KPUB: Failed to clone the local publishing repo !"
+		else
+		    echo-error "KPUB: Creating new bare repo for publishing..."
+		    mkdir -p "$KPUB_PUBLISH_REMOTE_REPOSITORY" \
+			&& cd "$KPUB_PUBLISH_REMOTE_REPOSITORY" \
+			&& git init --bare --shared \
+			    || kpub-error "KPUB: Failed to create the publishing repo !"
+		fi
+	    else kpub-error "KPUB: Unable to find the publishing repo !"
+	    fi
+	fi
+    fi
+
+    # Forget 'target local'...
+    kpub-rmDir "$KPUB_CACHETGT_DIR"
+
+    # Clone or 'pull' the remote source:
+    kpub-syncGitRepo "$KPUB_CACHE_DIR" "$KPUB_CACHETGT_NAME" \
+	"$KPUB_PUBLISH_REMOTE_REPOSITORY" "$KPUB_PUBLISH_BRANCH"
+}
+
+#######################################
+# PUBLISH - Process:
+#######################################
+
+#######################################
+kpub-resetTgtWorkingTree () {
+    kpub-resetWorkingTree "$KPUB_CACHETGT_DIR"
+    #kpub-resetWorkingTree "$KPUB_CACHESRC_DIR"
+}
+
+#######################################
+kpub-filterCommitMessage () { grep -v '^[ \t]*#' || : ; }
+
+#######################################
+kpub-generateDiffCommitMessage () {
+    local diffFile="$1" commitMessageFile="$2"
+    echo " * Extracting commit message from: '$diffFile'"
+    if [[ -f "$diffFile" ]] ; then
+	# Check file status:
+	local fileStatus
+	fileStatus="$(git status --porcelain "$diffFile")"
+	if [[ "$fileStatus" == 'A '* ]] ; then
+	    # File is new, we can't diff, so just add full
+	    # content.
+	    #echo "! NEW FILE ! $fileStatus" >&2
+	    <"$diffFile" kpub-filterCommitMessage >>"$commitMessageFile"
+	else
+	    # Generate commit message from a specific
+	    # file 'diff'.
+	    #echo "! DIFF FILE !" >&2
+	    git diff --cached "$diffFile" \
+		| grep '^+[^+]' | cut -b2- \
+		| kpub-filterCommitMessage \
+		      >>"$commitMessageFile" \
+		|| kpub-error "Failed to extract commit message from: '$diffFile'."
+	fi
+	#TODO: We might want to "auto sign" or something...
+	echo "Kommando Publisher - [$diffFile]" >>"$commitMessageFile"
+	#less "$commitMessageFile"
+    else kpub-error "Could not find: '$diffFile'"
+    fi
+}
+
+#######################################
+readonly MAX_STATUS_RETRY=8
+kpub-commitSnapshot () {
+    # Pre-publish Event:
+    kpub-eventThrow 'onPrePublish'
+
+    # We go in the publishing root dir:
+    cd "$KPUB_CACHETGT_DIR"
+
+    # Check git status of the snapshot and auto-add/replace:
+    local gitStatus statusLine statusCode objPath
+    local validStatus=1 statusChanged=0
+    gitStatus="$(mktemp)"
+    git status --porcelain -z >>"$gitStatus"
+    while IFS= read -d '' statusLine ; do
+	statusCode="${statusLine:0:2}"
+	objPath="$(<<<"${statusLine:2}" sed -e 's,^[ ]\+,,')"
+	#echo "Code '${statusCode}' - Object '${objPath}'" >&2
+	case "$statusCode" in
+	    'D '|' D') git rm "$objPath" ; statusChanged=1 ;;
+	    'M '|' M'|'??') git add "$objPath" ; statusChanged=1 ;;
+	    *) echo "Unknown status '$statusCode' (for '${objPath}')." >&2 ; validStatus=0 ;;
+	esac
+    done <"$gitStatus"
+    rm "$gitStatus"
+
+    # If statusRetry is equals to 0, then we should
+    # be in a good sate...
+    if (( validStatus )) ; then
+	# Check if there a change in the published revision ?
+	if (( statusChanged )) ; then
+	    # Now we should be able to attempt to commit:
+	    local commitMessage
+	    commitMessage="$(mktemp)"
+	    if [[ -n "$KPUB_COMMIT_MESSAGE_DIFF_EXTRACT" ]] ; then
+		kpub-generateDiffCommitMessage "$KPUB_COMMIT_MESSAGE_DIFF_EXTRACT" "$commitMessage" \
+		    || kpub-error "Failed to generate commit message !"
+	    else
+		cat >>"$commitMessage" <<COMMIT_MESSAGE
+Automagick publishing commit...
+
+NoStress Kommando Publisher.
+COMMIT_MESSAGE
+	    fi
+
+	    git commit -F "$commitMessage" -s
+	    # --author='' --data=''
+	    rm "$commitMessage"
+
+	    # Once commited we should push back:
+	    git push origin "$KPUB_PUBLISH_BRANCH"
+
+	    # Post-publish Event:
+	    kpub-eventThrow 'onPostPublish'
+
+	    # Publication done.
+	    echo "KPUB: Published new revision !" >&2
+	else echo "KPUB: Tracked revision doesn't change the current published revision." >&2
+	fi
+    else kpub-error "KPUB: Unsupported git status encountered."
+    fi
+}
+
+#######################################
+kpub-publishSnapshot () {
+    echo " * Processing source snapshot..."
+
+    # Be sure to be on the publishing branch:
+    local branches
+    branches="$(kpub-git "$KPUB_CACHETGT_DIR" branch -v)"
+    if [[ -n "$branches" ]] ; then
+	if <<<"$branches" grep -q "$KPUB_PUBLISH_BRANCH" ; then
+	    kpub-git "$KPUB_CACHETGT_DIR" checkout "$KPUB_PUBLISH_BRANCH"
+	else
+	    kpub-git "$KPUB_CACHETGT_DIR" checkout -b "$KPUB_PUBLISH_BRANCH"
+	fi
+    else echo "Total void target repository..." >&2
+    fi
+
+    # Remove working tree (to be sure not to have zombie files...)
+    kpub-resetTgtWorkingTree
+
+    # Do the copy snapshot:
+    kpub-trackSnapshot
+
+    # Commit the new state:
+    kpub-commitSnapshot
+
+    # Keep the source revision:
+    kpub-resetFile "$KPUB_CACHESRC_TRACKREV"
+    echo "$KPUB_SRC_HEADREV" >>"$KPUB_CACHESRC_TRACKREV"
+
+    # Keep the published DB:
+    kpub-rmFile "$KPUB_CACHE_PUBLISHDB"
+    cp "$KPUB_CACHE_TRACKDB" "$KPUB_CACHE_PUBLISHDB"
+}
+
+#######################################
+kpub-processPublishing () {
+    # Initialized basic cache data:
+    kpub-cacheInit
+
+    # Synchronize Source cache:
+    kpub-syncSrcCache
+
+    # Track source:
+    local newContent=0
+    kpub-trackSrcCache
+
+    # We must compare changes that are
+    # not only a new revision (new tracked
+    # files or newly untracked...)
+    diff "$KPUB_CACHE_TRACKDB" "$KPUB_CACHE_PUBLISHDB" &>/dev/null || newContent=1
+
+    # Do we need to attempt a new publishing ?
+    if (( newContent )) ; then
+	echo "KPUB: New revision to process (${KPUB_SRC_HEADREV:0:8}...)..."
+
+	# Synchronize Target cache:
+	kpub-syncTgtCache
+
+	# Publish files
+	kpub-publishSnapshot
+    else echo-error "KPUB: No new content to publish !"
+    fi
+}
+
+###############################################################################
+# Kommando Publisher - Top-Level commands:
+###############################################################################
+
+#######################################
+kpub-lish () {
+    # Load project context:
+    local rootDir="${1:-}"
+    kpub-contextLoad "$1"
+    echo "KPUB: Attempt to publish '${KPUB_NAME}'..."
+
+    # Prepare Layout:
+    kpub-contextLayout
+
+    # Do the publishing process:
+    kpub-processPublishing
+
+    # That's it.
+    echo "KPUB: Job done."
+}
+
+#######################################
+kpub-lishAll () {
+    # Load root directory:
+    local relRoot="${1:-$SCRIPT_LAUNCH_DIR}" absRoot
+    absRoot="$(kpub-effPath "$(kpub-absPath "$SCRIPT_LAUNCH_DIR" "$relRoot")" )"
+    if [[ -d "$absRoot" ]] ; then
+	local projList eProj projDir
+	projList="$(mktemp)"
+	find "$absRoot" -name "$KPUB_CONF_NAME" -type f -print0 >>"$projList"
+	# We need to export some environment...
+	export KPUB_DEBUG \
+	       KPUB_VERBOSE \
+	       KPUB_IGNORE_SOURCE_REV \
+	       KPUB_CREATE_LOCAL_TARGET
+	# And process all projects...
+	local continueOnError=0
+	while IFS= read -d '' eProj || [[ -n "$eProj" ]] ; do
+	    projDir="${eProj%/*}"
+	    # Call a sub-process to publish...
+	    "$SCRIPT_PATH" publish "$projDir" \
+		|| (( continueOnError )) \
+		|| kpub-error "Failed to publish '$projDir'"
+	done <"$projList"
+	rm "$projList"
+    fi
+}
+
+###############################################################################
+# Kommando Publisher - Help:
+###############################################################################
+
+#######################################
+kpub-help () {
+    cat >&2 <<KPUB_HELP
+Usage:
+  \$ ${SCRIPT_NAME} <command> [<path>]
+
+Where <command> can be:
+
+  help, --help ,-h
+      This help.
+
+  init [<path>]
+      Initialize a publish project.
+
+  publish [<path>]
+      Check if something new can be published and publish it.
+
+  publish-all [<path>]
+      Search for all kommando-publish projects below the specified
+path (or the current path if none specified). And 'publish' each
+project found. The search is based upon configuration file ($KPUB_CONF_NAME).
+
+Files:
+
+  './$KPUB_CONF_NAME' - The configuration file.
+  './$KPUB_TAB_NAME' - The published elements from the source repo.
+
+Pipeline:
+
+ { [Master] Private Repository } (Conf: KPUB_TRACK_REMOTE_REPOSITORY)
+
+                | |
+  <branch-to-publish> (Conf: KPUB_TRACK_BRANCH)
+                | |
+              \\     /
+               \\   /
+                \\_/
+
+ <${SCRIPT_NAME} filter working tree, apply publishing 'patches'>
+
+                | |
+  <publishing-target-branch> (Conf: KPUB_PUBLISH_BRANCH)
+                | |
+              \\     /
+               \\   /
+                \\_/
+
+ { [Master] Public Repository } (Conf: KPUB_PUBLISH_REMOTE_REPOSITORY)
+
+
+KPUB_HELP
+}
+
+###############################################################################
+# Kommando Publisher - Parse arguments:
+###############################################################################
+
+#######################################
+while [[ -n "${1:-}" ]] ; do
+    curArg="$1" ; shift
+    case "$curArg" in
+	'-f'|'--force') KPUB_IGNORE_SOURCE_REV=1 ;;
+	'help'|'--help'|'-h') kpub-help ; break ;;
+	'init') kpub-init "$@" ; break ;;
+	'publish') kpub-lish "$@" ; break ;;
+	'publish-all') kpub-lishAll "$@" ; break ;;
+	*) kpub-error "Invalid argument '$curArg' !" ;;
+    esac
+done
+
+#######################################
+exit 0

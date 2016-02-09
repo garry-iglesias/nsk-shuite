@@ -1,0 +1,25 @@
+# 2016 - Feb 08 [11:11]
+###############################################################################
+Initial ChangeLog message.
+This file will be the public brief for the NoStress Kommando Shell Suite.
+
+Those tools were in-house projects. They will be released publicly and
+are not yet full-featured, and bug-free. Also documentation is sparse
+and should be improved "on demand".
+
+A couple of BASH scripts gathered from NSHQ devs:
+   * Kommando Auto-builder: a build integration tool.
+   * Kommando Change Logger: a tool to maintain ChangeLogs like this one.
+   * Kommando Hack Assist: a command line "power tool" for admin and devops.
+   * Kommando Publisher: a git repo selection publisher.
+   * A simple ISO mounter.
+   * A "quick-and-dirty" installer: a simple tool to generate a ~/bin symlink
+     to a specified executable.
+   * A git repository tool to easily work with several git repositories.
+   * System Configuration Version Control: a tool to keep a track of
+     configuration file in a git repository.
+   * A init ramdisk file extractor.
+   * SSH Key autogen and upload: "brute" script to configure remote SSH key.
+
+This collection of tools have been developed over the initial period of
+2013-2016 for internal development and administration.

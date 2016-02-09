@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+###############################################################################
+# A simple ISO image mounter. Garry Iglesias 2015-2016.
+###############################################################################
+set -Cue
+
+#######################################
+# Global paramaters:
+readonly KMOUNT_ROOT="${KMOUNT_ROOT:-/mnt}"
+
+###############################################################################
+# Internal functions:
+###############################################################################
+
+#######################################
+nsk-error () { echo "Error:" "$@" >&2 ; exit 1 ; }
+
+#######################################
+# Mount an ISO image below KMOUNT_ROOT.
+# $1 -> ISO image file path.
+mountISO () {
+    local isoPath="$1"
+    if [[ "${isoPath##*.}" == 'iso' ]] ; then
+	if [[ -f "$isoPath" ]] ; then
+	    local isoName mntDir
+	    isoName="$(basename "$isoPath" .iso)"
+	    mntDir="$KMOUNT_ROOT/$isoName"
+	    if mount 2>/dev/null | grep "on $mntDir type" &>/dev/null ; then
+		# Mount point already used...
+		cat >&2 <<MOUNT_POINT_ALREADY_USED
+Error: mount point '$mntDir' already used.
+Nothing done.
+MOUNT_POINT_ALREADY_USED
+	    else
+		# Do the mount:
+		cat <<MOUNT_BANNER
+=======================================
+= Mounting ISO image [$isoName]...
+= Mount Point: '$mntDir'
+=======================================
+MOUNT_BANNER
+		[[ -d "$mntDir" ]] || mkdir -p "$mntDir" \
+		    || nsk-error "Can't create mount point: '$mntDir'"
+		if mount -t iso9660 -o loop "$isoPath" "$mntDir" ; then
+		    echo "ISO image accessible at: $mntDir"
+		else nsk-error "Failed to mount ISO image."
+		fi
+	    fi
+	else nsk-error "ISO image not found at: '$isoPath'"
+	fi
+    else nsk-error "Specified file is not an ISO image: '$isoPath'"
+    fi
+}
+
+###############################################################################
+# Parse arguments:
+###############################################################################
+
+(( !EUID )) || nsk-error "You must use this command with administrator privilege !"
+
+#######################################
+if [[ -n "${1:-}" ]]
+then for isoImg ; do mountISO "$isoImg" ; done
+else nsk-error "No ISO image specified !"
+fi

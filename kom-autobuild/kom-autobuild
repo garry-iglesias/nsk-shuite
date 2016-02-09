@@ -1,0 +1,883 @@
+#!/usr/bin/env bash
+#kom-autobuild
+###############################################################################
+# Kommando autobuild - Build Integration Package.
+# (c) Garry Iglesias - 2015-2016
+###############################################################################
+set -Cue
+
+#######################################
+# Some magicks
+readonly SCRIPT_LAUNCH_DIR="$( pwd )"
+readonly SCRIPT_NAME="$( basename "${0}" )"
+readonly SCRIPT_DIR="$( cd "$( dirname "${0}" )" && pwd )"
+readonly SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+###############################################################################
+# Kommando Auto Build - Environment Parameters:
+###############################################################################
+KAB_FORCE_BUILD=${KAB_FORCE_BUILD:-0}
+
+###############################################################################
+# Kommando Auto Build - "System" functions:
+###############################################################################
+
+#######################################
+kab-error () { echo "$@" >&2 ; exit 1 ; }
+
+#######################################
+kab-callArgs () {
+    local fn="$1" dir
+    shift
+    for dir ; do "$fn" "$dir" ; done
+}
+
+#######################################
+kab-checkDir () {
+    [[ -d "$1" ]] || mkdir -p "$1" \
+	|| kab-error "KAB: Couldn't create directory: '$1'"
+}
+
+#######################################
+kab-resetDir () {
+    [[ ! -d "$1" ]] || rm -rf "$1" \
+	|| kab-error "KAB: Couldn't reset (remove) directory: '$1'"
+    mkdir -p "$1" || kab-error "KAB: Couldn't reset (create) directory: '$1'"
+}
+
+#######################################
+kab-rmFile () {
+    [[ ! -f "$1" ]] || rm "$1" \
+	|| kab-error "KAB: Couldn't remove file: '$1'"
+}
+
+#######################################
+kab-resetFile () {
+    [[ ! -f "$1" ]] || rm "$1" \
+	|| kab-error "KAB: Couldn't reset file: '$1'"
+    touch "$1"
+}
+
+#######################################
+kab-checkFile () { [[ -f "$1" ]] || touch "$1" ; }
+
+#######################################
+kab-checkDirs () { kab-callArgs kab-checkDir "$@" ; }
+kab-resetDirs () { kab-callArgs kab-resetDir "$@" ; }
+kab-rmFiles () { kab-callArgs kab-rmFile "$@" ; }
+kab-resetFiles () { kab-callArgs kab-resetFile "$@" ; }
+
+#######################################
+kab-absPath () { [[ "$2" == /* ]] && echo "$2" || echo "${1}/${2}" ; }
+kab-effPath () { ( cd "$1" && pwd ) ; }
+
+#######################################
+kab-abs2rel () {
+    local ref="$1" abs="$2"
+    local curBase="$ref" relLeft="" relRight
+    while relRight="${abs#$curBase}" && \
+	[[ "$curBase" != "/" \
+	&& ( "$relRight" == "$abs" || "${relRight:0:1}" != "/" ) \
+	]]
+    do
+	curBase="$(dirname "$curBase")"
+	relLeft="${relLeft}../"
+    done
+    if [[ "/" == "$curBase" ]] ; then echo "$abs"
+    else echo "${relLeft}${relRight:1}"
+    fi
+}
+
+#######################################
+kab-unhashComment () { sed -e 's,#.*$,,g' ; }
+kab-unemptyLines () { grep -v '^[ \t]*$' ; }
+kab-cleanSource () { kab-unhashComment | kab-unemptyLines ; }
+
+#######################################
+kab-date () { date ; }
+
+#######################################
+kab-git-branchRef () { cd "$1" && git show-ref -s --heads "$2" ; }
+
+###############################################################################
+# Kommando Auto Build - Context:
+###############################################################################
+
+#######################################
+readonly KAB_CONF_NAME='kab.conf'
+readonly KAB_KABTAB_NAME='kab.tab'
+readonly KAB_EVENTAB_NAME='kab.events'
+readonly KAB_REPODB_NAME='repo.db'
+readonly KAB_EVENTDB_NAME='events.db'
+readonly KAB_REPORTJOURNAL_NAME='journal'
+readonly KAB_SUCCEED_SUFFIX='.succeed'
+readonly KAB_FAILED_SUFFIX='.failed'
+
+#######################################
+kab-context () {
+    local kabPath="${1%/}"
+    KAB_ROOT_DIR="$kabPath"
+    KAB_NAME="${kabPath##*/}"
+    KAB_CONF_PATH="${kabPath}/${KAB_CONF_NAME}"
+    KAB_TAB_PATH="${kabPath}/${KAB_KABTAB_NAME}"
+    KAB_EVENTAB_PATH="${kabPath}/${KAB_EVENTAB_NAME}"
+    # Default values for overridable directories:
+    KAB_CACHE_DIR="${kabPath}/cache"
+    KAB_BUILD_DIR="${kabPath}/build"
+    KAB_REPORT_DIR="${kabPath}/report"
+}
+
+#######################################
+# Part of the context which requires
+# having the configuration loaded
+# first.
+kab-contextFinalize () {
+    # Sanity check:
+    [[ -n "${KAB_TRACK_BRANCH:-}" ]] \
+	|| kab-error "KAB: Tracking branch not specifed (KAB_TRACK_BRANCH)."
+
+    # Post-process configured environment:
+    KAB_CACHE_DIR="$(kab-projAbsDirPath "$KAB_CACHE_DIR")"
+    KAB_BUILD_DIR="$(kab-projAbsDirPath "$KAB_BUILD_DIR")"
+    KAB_REPORT_DIR="$(kab-projAbsDirPath "$KAB_REPORT_DIR")"
+
+    # And build the complete environment with definitive values:
+    KAB_EVENTDB_PATH="${KAB_CACHE_DIR}/${KAB_EVENTDB_NAME}"
+    KAB_REPODB_PATH="${KAB_CACHE_DIR}/${KAB_REPODB_NAME}"
+    KAB_REPORTJOURNAL_PATH="${KAB_REPORT_DIR}/${KAB_REPORTJOURNAL_NAME}"
+
+    # Refresh Cached Tabs:
+    kab-resetFile "$KAB_EVENTDB_PATH"
+    <"$KAB_EVENTAB_PATH" kab-cleanSource >>"$KAB_EVENTDB_PATH"
+}
+
+#######################################
+kab-contextShut () {
+    unset KAB_ROOT_DIR \
+	KAB_CONF_PATH \
+	KAB_TAB_PATH KAB_EVENTAB_PATH \
+	KAB_CACHE_DIR \
+	KAB_BUILD_DIR \
+	KAB_REPORT_DIR \
+	KAB_REPODB_PATH
+}
+
+#######################################
+kab-projAbsDirPath () {
+    # Check directory presence using the 'dirty' path:
+    local rawAbs
+    rawAbs="$(kab-absPath "${KAB_ROOT_DIR}" "$1")"
+    [[ -d "$rawAbs" ]] || mkdir -p "$rawAbs" \
+	|| kab-error "Couldn't create directory: '$1'"
+
+    # Now we are sure that a directory is present,
+    # get the 'clean effective path':
+    kab-effPath "$rawAbs"
+}
+
+#######################################
+kab-contextLoad () {
+    local kabRel="$1" kabPath
+    kabPath="$(kab-effPath "$kabRel")"
+    if [[ -n "$kabPath" ]] ; then
+	# Setup basic context:
+	kab-context "$kabPath"
+	if [[ -f "$KAB_CONF_PATH" ]] ; then
+	    # Load KAB configuration:
+	    source "$KAB_CONF_PATH"
+
+	    # Finalize the context:
+	    kab-contextFinalize
+	else kab-error "KAB: No configuration found at: '$kabPath'"
+	fi
+    else kab-error "KAB: Can't find location: '$kabRel'"
+    fi
+}
+
+###############################################################################
+# Kommando Auto Build - Event Tab:
+###############################################################################
+
+#######################################
+kab-eventThrow () {
+    local eventName="$1" eventRecord ; shift
+    #echo "EVENT{${eventName}}" "$@" >&2
+    # Get event record:
+    eventRecord="$(<"$KAB_EVENTDB_PATH" grep -e "^${eventName}|" || : )"
+    #echo "Event record: '${eventRecord}'" >&2
+    if [[ -n "$eventRecord" ]] ; then
+	# Extract script path:
+	local eventScript="${eventRecord#*|}" absPath
+	absPath="$(kab-absPath "$KAB_ROOT_DIR" "$eventScript")"
+	if [[ -x "$absPath" ]] ; then
+	    # Execute event handler script:
+	    if "$absPath" "$@" ; then return 0
+	    else return 1
+	    fi
+	else kab-error "KAB: Invalid event callback: '${eventScript}'."
+	fi
+    else return 0 # No callback -> so always OK.
+    fi
+}
+
+###############################################################################
+# Kommando Auto Build - Project setup:
+###############################################################################
+
+#######################################
+kab-genConf () {
+    local defaultBuild defaultReport
+    defaultBuild="$(kab-abs2rel "$KAB_ROOT_DIR" "$KAB_BUILD_DIR")"
+    defaultReport="$(kab-abs2rel "$KAB_ROOT_DIR" "$KAB_REPORT_DIR")"
+    cat <<KAB_CONF_DEFAULT
+###############################################################################
+# Kommando Auto Build Project - BASH Script Configuration - ${KAB_NAME}
+###############################################################################
+
+###############################################################################
+# You can override some defaults here.
+# Just uncomment the corresponding variable
+# definition. Default value is the one in the
+# 'stock' commented definition.
+###############################################################################
+
+#######################################
+# Project's name:
+#KAB_NAME='${KAB_NAME}'
+
+#######################################
+# Source cache directory:
+#KAB_CACHE_DIR='$(kab-abs2rel "$KAB_ROOT_DIR" "$KAB_CACHE_DIR")'
+
+#######################################
+# Build directory (default: ${defaultBuild}):
+#KAB_BUILD_DIR='${defaultBuild}'
+#KAB_BUILD_DIR="\${HOME}/tmp/kabuilds/${KAB_NAME}"
+
+#######################################
+# Reporting directory (default: ${defaultReport}):
+#KAB_REPORT_DIR='${defaultReport}'
+#KAB_REPORT_DIR="\${HOME}/public_html/kab-reports/${KAB_NAME}"
+#Notice: You *may* want to add the reports to the git versionning.
+# This is absolutely valid, but if you set a directory OUTSIDE the
+# current git repo, be sure it is git-tracked elsewhere. If not
+# report journal could be lost. At the end you chose the destiny
+# of the reports, so it's more a reminder than a warning.
+
+###############################################################################
+# Those variables are parameters for the build process:
+#-----------------------------------------------------------------------------
+# Note: you must define these variables, there are NO DEFAULT VALUE for them.
+# Removing on define WILL lead to 'undefined' behavior.
+# (Most probably a 'halt error).
+###############################################################################
+
+#######################################
+# Tracking repo (reference a repository
+# in the '${KAB_KABTAB_NAME}'.
+#UNUSUED: KAB_TRACK_REPO='${KAB_NAME}-repo-name'
+
+#######################################
+# Name of the branch to be tracked.
+KAB_TRACK_BRANCH='master'
+
+KAB_CONF_DEFAULT
+}
+
+#######################################
+kab-genTab () {
+    cat <<KAB_TAB_DEFAULT
+# The KAB TAB for ${KAB_NAME}.
+# <repo-name>|<remote-repo-address>
+${KAB_NAME}-repo-name|ssh://user@server/path/to/remote.git
+KAB_TAB_DEFAULT
+}
+
+#######################################
+kab-genDefaultEventTab () {
+    cat <<KAB_DEFAULT_EVENTAB
+###############################################################################
+# Kommando Auto Build Tab - ${KAB_NAME}
+###############################################################################
+# Syntax:
+# <Event-name>|<path/to/script>
+# A relative path is originated from autobuild project's root directory.
+###############################################################################
+# List of available events:
+#
+# onPreBuild : called just before starting a new build.
+#
+# onSuccess : called whenever a new build succeeded.
+#
+# onFailure : called whenever a new build failed.
+#
+###############################################################################
+
+# Examples:
+#onPreBuild|events/preBuild
+#onSuccess|events/onSuccess
+#onFailure|events/onFailure
+KAB_DEFAULT_EVENTAB
+}
+
+#######################################
+kab-genGitignore () {
+    cat <<KAB_TAB_DEFAULT
+# The gitignore tules for KAB project: ${KAB_NAME}
+
+# Ignore cache and build directories:
+/cache/
+/build/
+
+# You may want to ignore the report...
+# ...or not... choice is yours.
+#/report/
+
+# Some default temps:
+*~
+
+KAB_TAB_DEFAULT
+}
+
+#######################################
+# $1 -> file path.
+# $2 -> content generator:
+kab-initFile () {
+    if [[ ! -f "$1" ]] ; then
+	"$2" >"$1"
+	[[ -z "${EDITOR:-}" ]] || "$EDITOR" "$1"
+    else echo "KAB: Ignore alrady exising file: $1" >&2
+    fi
+}
+
+#######################################
+kab-create () {
+    local kabPath="${1:-}"
+    if [[ -n "$kabPath" ]] ; then
+	# First ensure there's a directory to work in:
+	local absPath effPath
+	absPath="$(kab-absPath "$SCRIPT_LAUNCH_DIR" "$kabPath")"
+	[[ -d "$absPath" ]] || mkdir -p "$absPath"
+
+	# Now we can get the real absolute path:
+	effPath="$(kab-effPath "$absPath")"
+
+	# And build a clean context:
+	kab-context "$absPath"
+
+	# Setup default KAB files:
+	kab-initFile "$KAB_TAB_PATH" kab-genTab
+	kab-initFile "$KAB_CONF_PATH" kab-genConf
+	kab-initFile "$KAB_EVENTAB_PATH" kab-genDefaultEventTab
+	kab-initFile "${KAB_ROOT_DIR}/.gitignore" kab-genGitignore
+
+    else kab-error "Missing KAB project argument !"
+    fi
+}
+
+###############################################################################
+# Kommando Auto Build - Project build:
+###############################################################################
+
+#######################################
+#OBSOLETE?
+kab-fetch-project () {
+    local sourceDir="${KAB_SOURCEDIR}"
+    [[ -f "$KAB_BUILDROOT" ]] || mkdir -p "$KAB_BUILDROOT"
+    if [[ -d "$sourceDir" ]] ; then
+	cd "$sourceDir" \
+	    && git fetch \
+	    && git checkout "${KAB_TRACKINGBRANCH}" \
+	    && git merge --ff-only "origin/${KAB_TRACKINGBRANCH}"
+    else
+	cd "$KAB_BUILDROOT" \
+	    && git clone -b "${KAB_TRACKINGBRANCH}" \
+	    "${KAB_SOURCEREPO}" "${KAB_WORKSOURCE_DIRNAME}"
+    fi
+    # And now get branch SHA:
+    KAB_HEADSHA="$(kab-git-branchRef "$sourceDir" "$KAB_TRACKINGBRANCH")"
+}
+
+#######################################
+#OBSOLETE?
+kab-autobuild () {
+    echo " * KAB Should autobuild a new revision..."
+    # Generate builder:
+    local builder="${KAB_BUILDROOT}/builder"
+    [[ ! -f "$builder" ]] || rm "$builder"
+    cat >"$builder" <<AUTOBUILDER
+#!$(which bash)
+#######################################
+set -Cue
+#######################################
+cd '${KAB_SOURCEDIR}'
+${KAB_BUILDCOMMAND}
+AUTOBUILDER
+
+    chmod +x "$builder"
+    # And execute builder:
+    [[ ! -f "$KAB_BUILDLOG" ]] || rm "$KAB_BUILDLOG"
+    if "$builder" >>"$KAB_BUILDLOG" ; then
+	echo "KAB: Build succeeds !"
+    else
+	echo "KAB: Build failed !"
+    fi
+}
+
+#######################################
+#OBSOLETE?
+kab-build-project () {
+    local kabPath="$1"
+    KAB_PROJECT_DIR="$(dirname "$kabPath")"
+    KAB_PROJECT_NAME="$(basename "${kabPath%${KAB_EXTENSION}}")"
+    # Load KAB:
+    echo " * Loading KAB project '${KAB_PROJECT_NAME}'..."
+    source "$kabPath"
+    KAB_SOURCEDIR="${KAB_BUILDROOT}/${KAB_WORKSOURCE_DIRNAME}"
+    KAB_BUILDLOG="${KAB_BUILDROOT}/build.log"
+    # Fetching sources:
+    echo " * Fetching project from '${KAB_SOURCEREPO}'..."
+    kab-fetch-project
+    # Check if we need update:
+    local needUpdate=0
+    if [[ -f "$KAB_HEADCOMMIT" ]] ; then
+	KAB_LASTBUILD="$(cat "$KAB_HEADCOMMIT")"
+	[[ "$KAB_LASTBUILD" == "$KAB_HEADSHA" ]] || needUpdate=1
+    else needUpdate=1
+    fi
+    if (( needUpdate )) ; then
+	kab-autobuild
+    fi
+}
+
+#######################################
+# Low level funcs:
+#######################################
+
+#######################################
+kab-applyRepos () {
+    local apply="$1" repoEntry repoName repoRemote
+    while IFS= read repoEntry ; do
+	repoName="${repoEntry%%|*}"
+	repoRemote="${repoEntry#*|}"
+	$apply "$repoName" "$repoRemote"
+    done <"$KAB_REPODB_PATH"
+}
+
+#######################################
+# Setup Sanity Check:
+#######################################
+
+#######################################
+kab-baseLocation () { echo -n "[...]/${baseDir}/" ; kab-abs2rel "$KAB_ROOT_DIR" "$1" ; }
+
+#######################################
+kab-checkRepoSetup () {
+    local repoName="$1" repoRemote="$2"
+    local repoBuilder="${KAB_ROOT_DIR}/${repoName}.build"
+    if [[ ! -f "$repoBuilder" ]] ; then
+	cat >&2 <<NO_BUILDER
+KAB: '$repoName' repository builder not found.
+Location: '$(kab-baseLocation "$repoBuilder")"'
+NO_BUILDER
+	checkOK=0
+    fi
+}
+
+#######################################
+kab-checkReposSetup () {
+    local checkOK=1 baseDir="${KAB_ROOT_DIR##*/}"
+    kab-applyRepos kab-checkRepoSetup
+    if (( !checkOK )) ; then
+	kab-error "KAB: Configuration must be fixed !"
+    fi
+}
+
+#######################################
+# CACHE Syncing:
+#######################################
+
+#######################################
+kab-syncRepo () {
+    local repoName="$1" repoRemote="$2"
+    local repoLocalDir="${KAB_CACHE_DIR}/${repoName}"
+    if [[ -d "$repoLocalDir" ]] ; then
+	echo " * Fetching repo '$repoName'..."
+	cd "$repoLocalDir" && git fetch
+    else
+	echo " * Cloning repo '$repoName'..."
+	# --bare was used but a "bare" mirror doesn't have any origin (or does it ?).
+	#OBSOLETE: --mirror could be used too, but it seems 'overkill' for our case.
+	cd "$KAB_CACHE_DIR" && git clone --mirror "$repoRemote" "$repoName"
+    fi
+}
+
+#######################################
+kab-syncRepos () { kab-applyRepos kab-syncRepo ; }
+
+#######################################
+kab-syncCache () {
+    echo "KAB: ${KAB_NAME} synchronizing cache..."
+    # Build the repo DB.
+    kab-rmFile "$KAB_REPODB_PATH"
+    <"$KAB_TAB_PATH" kab-cleanSource >"$KAB_REPODB_PATH"
+
+    # Synchronize the repos:
+    kab-syncRepos
+}
+
+#######################################
+# REPO Tracking:
+#######################################
+
+#######################################
+kab-trackRepo () {
+    local repoName="$1" repoRemote="$2" headRef
+    local repoLocalDir="${KAB_CACHE_DIR}/${repoName}"
+    local repoTrackTagPath="${repoLocalDir}.track"
+    echo " * Tracking repo: ${repoName}"
+    headRef="$(kab-git-branchRef "$repoLocalDir" "$KAB_TRACK_BRANCH")"
+    #echo "   HEAD: $headRef"
+    if [[ -f "$repoTrackTagPath" ]] ; then
+	local trackRef
+	trackRef="$(cat "$repoTrackTagPath")"
+	[[ "$trackRef" == "$headRef" ]] || KAB_MUSTBUILD=1
+    else KAB_MUSTBUILD=1
+    fi
+}
+
+#######################################
+kab-trackRepositories () {
+    echo "KAB: ${KAB_NAME} tracking repositories..."
+    if (( KAB_FORCE_BUILD ))
+    then KAB_MUSTBUILD=1
+    else KAB_MUSTBUILD=0
+	kab-applyRepos kab-trackRepo
+    fi
+}
+
+#######################################
+# BUILD Stage:
+#######################################
+
+#######################################
+kab-setupRepoBuild () {
+    local repoName="$1" headRef
+    local repoLocalDir="${KAB_CACHE_DIR}/${repoName}"
+    local repoBuildDir="${KAB_BUILD_DIR}/${repoName}"
+    local repoBuildTagPath="${repoBuildDir}.track"
+
+    # First git-clone the repo:
+    cd "$KAB_BUILD_DIR" && git clone -b "$KAB_TRACK_BRANCH" "$repoLocalDir" "$repoName"
+
+    # Then get building ref:
+    kab-git-branchRef "$repoBuildDir" "$KAB_TRACK_BRANCH" >"$repoBuildTagPath"
+
+    # Then should call some 'project-hook' maybe ?
+}
+
+#######################################
+kab-setupBuild () {
+    echo " * Setting up repos..."
+    kab-resetDir "$KAB_BUILD_DIR"
+    kab-applyRepos kab-setupRepoBuild
+}
+
+#######################################
+kab-compileBuildRepo () {
+    local repoName="$1" #repoRemote="$2"
+    local repoBuilder="${KAB_ROOT_DIR}/${repoName}.build"
+    local repoBuildDir="${KAB_BUILD_DIR}/${repoName}"
+    local repoBuildLog="${repoBuildDir}.buildlog"
+    local repoBuildRC="${repoBuildDir}.builder"
+
+    # Generate builder script:
+    cat - "$repoBuilder" >"$repoBuildRC" <<BUILDRC_HEAD
+#!${bashLoc}
+set -Cue
+#######################################
+# Build environment:
+readonly KAB_BUILD_REPOROOT='${repoBuildDir}'
+cd '${repoBuildDir}'
+#######################################
+# Build ${KAB_NAME}/${repoName}:
+BUILDRC_HEAD
+    chmod +x "$repoBuildRC"
+
+    # Actual repository compilation:
+    echo " * Compiling repo: '$repoName'..."
+    echo " ! Warning, this can takes a long time !" >&2
+
+    # Export some vars for events:
+    export KBUILD_BUILD_DIR="$repoBuildDir"
+
+    # Throw the prebuild event:
+    kab-eventThrow 'onPreBuild'
+
+    if "$repoBuildRC" &>"$repoBuildLog" ; then
+	mv "$repoBuildLog" "${repoBuildDir}${KAB_SUCCEED_SUFFIX}"
+	kab-eventThrow 'onSuccess' || :
+    else
+	mv "$repoBuildLog" "${repoBuildDir}${KAB_FAILED_SUFFIX}"
+	kab-eventThrow 'onFailure' || :
+    fi
+
+    # Clear event environment:
+    unset KBUILD_BUILD_DIR
+}
+
+#######################################
+kab-compileBuild () {
+    local bashLoc
+    bashLoc="$(which bash)"
+    kab-applyRepos kab-compileBuildRepo
+}
+
+#######################################
+# BUILD Reporting:
+#######################################
+
+#######################################
+kab-onReportClose () {
+    printf "%q" "$1" >>"$onReportClose" ; shift
+    local arg
+    for arg ; do printf " %q" "$arg" ; done >>"$onReportClose"
+    printf "\n" >>"$onReportClose"
+}
+
+#######################################
+kab-reportRepo () {
+    local repoName="$1" #repoRemote="$2"
+    local repoBuildDir="${KAB_BUILD_DIR}/${repoName}"
+    local repoBuildTagPath="${repoBuildDir}.track"
+    local repoBuildStatus repoBuildTag
+
+    # Load build tag:
+    repoBuildTag="$(cat "$repoBuildTagPath")"
+
+    # Check build status:
+    if [[ -f "${repoBuildDir}${KAB_SUCCEED_SUFFIX}" ]] ; then repoBuildStatus="succeed"
+    elif [[ -f "${repoBuildDir}${KAB_FAILED_SUFFIX}" ]] ; then
+	repoBuildStatus="failed"
+	buildSucceed=0
+    else
+	repoBuildStatus="!broken!"
+	buildSucceed=0
+    fi
+
+    # Journal log:
+    echo "${repoName}:${repoBuildTag}:${repoBuildStatus}" >>"$buildJournal"
+}
+
+#######################################
+kab-reportKeepRepo () {
+    local repoName="$1" #repoRemote="$2"
+    local repoLocalDir="${KAB_CACHE_DIR}/${repoName}"
+    local repoTrackTagPath="${repoLocalDir}.track"
+    local repoBuildDir="${KAB_BUILD_DIR}/${repoName}"
+    local repoBuildTagPath="${repoBuildDir}.track"
+    local repoBuildLog
+
+    repoBuildLog="${repoBuildDir}${KAB_SUCCEED_SUFFIX}"
+    if [[ ! -f "$repoBuildLog" ]] ; then
+	repoBuildLog="${repoBuildDir}${KAB_FAILED_SUFFIX}"
+	if [[ ! -f "$repoBuildLog" ]] ; then
+	    echo "KAB: '${repoName}' build log missing !" >&2
+	    repoBuildLog=""
+	fi
+    fi
+
+    if [[ -n "$repoBuildLog" ]] ; then
+	# Copy log:
+	local reportBuildLog
+	reportBuildLog="${reportBuildDir}/${repoBuildLog##*/}"
+	cp "$repoBuildLog" "$reportBuildLog"
+    fi
+
+    # Apply track tag:
+    kab-rmFile "$repoTrackTagPath" && cp "$repoBuildTagPath" "$repoTrackTagPath"
+}
+
+#######################################
+kab-reportBuild () {
+    echo "KAB: Building report for '${KAB_NAME}'..."
+    kab-checkDir "$KAB_REPORT_DIR"
+    kab-checkFile "$KAB_REPORTJOURNAL_PATH"
+
+    # Generate build journal:
+    local buildJournal="${KAB_BUILD_DIR}/build-journal"
+    local onReportClose="${KAB_BUILD_DIR}/report-close"
+    local buildSucceed=1
+
+    # Now do each repo reporting:
+    kab-applyRepos kab-reportRepo
+
+    # Generate report's journal:
+    local buildID buildStatus
+    buildID="$(<"$buildJournal" md5sum | sed -e 's,\([0-9a-f]\+\).*$,\1,g')"
+    (( buildSucceed )) && buildStatus="succeed" || buildStatus="failed"
+
+    # Build result keeping:
+    local reportBuildDir="${KAB_REPORT_DIR}/logs/${buildID:0:2}/${buildID:2}"
+    local reportBuildJournal="${reportBuildDir}/${KAB_REPORTJOURNAL_NAME}"
+    echo " * Building report for build #${buildID}..."
+
+    # The build journal:
+    mkdir -p "$reportBuildDir"
+    mv "$buildJournal" "${reportBuildJournal}"
+
+    # The build logs:
+    kab-applyRepos kab-reportKeepRepo
+
+    # And reference this build in the main journal:
+    echo "${buildID}|${buildStatus}|${KAB_BUILD_START_TIME}|${KAB_BUILD_END_TIME}" \
+	>>"$KAB_REPORTJOURNAL_PATH"
+}
+
+#######################################
+# BUILD Top-level:
+#######################################
+
+#######################################
+kab-processBuild () {
+    echo "KAB: ${KAB_NAME} building version..."
+
+    KAB_BUILD_START_TIME="$(kab-date)"
+
+    kab-setupBuild
+    kab-compileBuild
+
+    KAB_BUILD_END_TIME="$(kab-date)"
+
+    kab-reportBuild
+
+    unset KAB_BUILD_START_TIME KAB_BUILD_END_TIME
+}
+
+#######################################
+kab-build-args () {
+    local curArg
+    while [[ "${1:-}" == '-'* ]] ; do
+	curArg="$1" ; shift
+	case "$curArg" in
+	    '-f'|'--force') KAB_FORCE_BUILD=1 ;;
+	    *) kab-error "kab-build: Invalid argument '$curArg'." ;;
+	esac
+    done
+    KAB_BUILD_RELPATH="${1:-.}"
+}
+
+#######################################
+kab-build () {
+    kab-build-args "$@"
+    if [[ -n "$KAB_BUILD_RELPATH" ]] ; then
+	# Load KAB context:
+	kab-contextLoad "$KAB_BUILD_RELPATH"
+
+	# Synchronize the cache:
+	kab-syncCache
+
+	# Sanity check base configuration:
+	kab-checkReposSetup
+
+	# Tracking:
+	kab-trackRepositories
+
+	# Building:
+	if (( KAB_MUSTBUILD )) ; then
+	    kab-processBuild
+	else echo "Nothing new to eat..."
+	fi
+
+    else kab-error "Missing KAB project argument !"
+    fi
+}
+
+###############################################################################
+# Kommando Auto Build - Inline help:
+###############################################################################
+
+#######################################
+kab-help () {
+    cat >&2 <<KAB_HELP
+Kommando Auto Build - Repository tracking builder.
+
+usage:
+
+  \$ ${SCRIPT_NAME} <command> [path/to/build/descriptor]
+
+Where <command> can be one of the following:
+
+  help ,--help ,-h
+                             This help.
+
+  create <path>
+                             Create a new build descriptor.
+                   If <path> is not specified, the current directory will be
+used.
+                   If you have the EDITOR environment variable set, it will be
+used to edit the generated default configuration files.
+
+  build [<path>]
+                             Execute the track build described at <path>.
+                   If <path> is not specified, the current directory will be
+used.
+
+=======================================
+ Build configuration:
+=======================================
+
+Two main files drive the build, and several user specified scripts.
+
+  './${KAB_CONF_NAME}': the main configuration file. This is a BASH snippet
+that is sourced to tweak the main build settings.
+
+  './${KAB_KABTAB_NAME}': the 'kab-tab' is simply a 'table' of all repos to
+be used for this build. The format is:
+
+<repo-name>|<tracked-remote-repo-path>
+
+KAB tracks each repository for a new version of the tracked branch specified
+in the KAB_TRACK_BRANCH configuration variable.
+
+When a new revision is found in one of the tracked repository, it will generate
+a new build and a report (by default in the ./report directory) in the journal.
+
+The build uses user scripts for building each repos:
+  ./<repo-name>.build
+
+Thoses are BASH snippets used during the build. Every output of those scripts
+are redirected to log files for the record. The build scripts must do all
+the necessary operations for each repo to be built and tested if necessary.
+
+The main journal file is a log of all builds. Each log entry reference a build
+ID. For each build ID, a corresponding ./report/logs/bu/ildID' direcroty holds
+all repos build logs.
+
+Each repo build log have a suffix:
+   '[...]/bu/ildID/<repo-name>$KAB_SUCCEED_SUFFIX' for a successful build.
+   '[...]/bu/ildID/<repo-name>$KAB_FAILED_SUFFIX' for a failed build.
+
+SOON...
+  * events hooks to call scripts on differents build events.
+
+KAB_HELP
+}
+
+###############################################################################
+# Parse command line:
+###############################################################################
+
+#######################################
+while [[ -n "${1:-}" ]] ; do
+    curArg="$1" ; shift
+    case "$curArg" in
+	'help'|'--help'|'-h') kab-help ; break ;;
+	'create') kab-create "$@" ; break ;;
+	'build') kab-build "$@" ; break ;;
+	*) kab-error "Invalid argument '$curArg' !" ;;
+    esac
+done
+
+#######################################
+exit 0

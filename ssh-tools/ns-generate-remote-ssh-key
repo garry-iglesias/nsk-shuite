@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# This script generates ssh keys for a remote server.
+#
+# Usage:
+#
+#       $ ns-generate-remote-ssh-key userlogin@remote.server.ip
+#
+
+# ============================================================================
+#       Global parameters:
+# ============================================================================
+debugMode=0
+enforceChMod=1
+
+remoteCredentials="$1"
+remoteServerUser="$( echo "$remoteCredentials" | cut -d@ -f1 )"
+remoteServerAddress="$( echo "$remoteCredentials" | cut -d@ -f2 )"
+
+encryptName="rsa"
+#encryptName="dsa"
+localSSHDir="$HOME/.ssh"
+
+fileIDPrivateName="<UNSET>"
+fileIDPublicName="<UNSET>"
+fileIDPrivatePath="<UNSET>"
+fileIDPublicPath="<UNSET>"
+fileAuthorized="<UNSET>"
+
+readonly NotImplemented="Not yet implemented !"
+
+# ============================================================================
+#       Functions:
+# ============================================================================
+
+#-----------------------------------------------
+# Error functions:
+printError() {
+    echo "Error:" "$@" >&2
+}
+
+throwError() {
+    echo "Error:" "$@" >&2
+    exit 1
+}
+
+#-----------------------------------------------
+# Generate Key filenames:
+setKeyNames() {
+    fileIDPrivateName="id_$encryptName"
+    fileIDPublicName="$fileIDPrivateName.pub"
+    fileIDPrivatePath="$localSSHDir/$fileIDPrivateName"
+    fileIDPublicPath="$localSSHDir/$fileIDPublicName"
+}
+
+#-----------------------------------------------
+# Generate authorized key filename:
+setAuthName() {
+    case "$encryptName" in
+    "rsa")      fileAuthorized="authorized_keys"        ;;
+    "dsa")      fileAuthorized="authorized_keys2"       ;;
+    *)  throwError "Unknown authorized name for encryption '$encryptName' !" ;;
+    esac
+}
+
+#-----------------------------------------------
+# Initialize encryption:
+initEncrypt() {
+    case "$encryptName" in
+    "rsa"|"dsa")
+        setKeyNames && setAuthName || return 1 ;;
+    *)  throwError "Unknown encryption '$encryptName'" ;;
+    esac
+}
+
+# ============================================================================
+#       Main Entry Point:
+# ============================================================================
+
+#TODO: Parse command line and support arguments
+
+# Preleminary argument checks:
+[[ -z "$1" ]] && throwError "You must specify a remote address 'user@server' !"
+
+# Debug
+(( $debugMode )) && cat >&2 <<DBG_VERBOSE
+remoteServerUser="$remoteServerUser"
+remoteServerAddress="$remoteServerAddress"
+DBG_VERBOSE
+
+# Welcome:
+cat <<WELCOME
+ SSH Key generator - For password-less remote connection.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    User:       $remoteServerUser
+    Server:     $remoteServerAddress
+    Encryption: $encryptName
+
+WELCOME
+
+# Initialize encryption:
+initEncrypt || exit 1
+
+# Check local ssh directory presence:
+echo " * Checking '$localSSHDir'..."
+[[ -d "$localSSHDir" ]] \
+    || mkdir -p "$localSSHDir" \
+    || throwError "Couldn't create directory: '$localSSHDir'"
+
+# Generate keys:
+echo " * Checking '$fileIDPrivatePath'..."
+if [[ ! -f "$fileIDPrivatePath" ]] ; then
+    cat <<SSH_KEYGEN
+ * We create the local host $encryptName key pair...
+
+ !! IT IS NOT RECOMMENDED TO HAVE A BLANK PASSPHRASE !!
+
+SSH_KEYGEN
+    ssh-keygen -t "$encryptName" -f "$fileIDPrivatePath"
+fi
+
+# Check public key:
+echo " * Checking '$fileIDPublicPath'..."
+if [[ ! -f "$fileIDPublicPath" ]] ; then
+    throwError "Public key not found as '$fileIDPublicPath' !"
+fi
+
+# Enforce secure permissions:
+if (( $enforceChMod )) ; then
+    echo " * Enforcing keys permissions"
+    chmod 600 "$fileIDPrivatePath"
+    chmod 644 "$fileIDPublicPath"
+fi
+
+# Generate remote-registerer:
+remoteRegisterScriptLocal="$(mktemp)"
+remoteRegisterScriptRemote=".remote.key-register"
+remotePublicIDUploadName=".$fileIDPublicName.upload"
+
+cat >"$remoteRegisterScriptLocal" <<REMOTE_REG
+#!/usr/bin/env bash
+sshDir="\$HOME/.ssh"
+pubKey="\$HOME/$remotePublicIDUploadName"
+authPath="\$sshDir/$fileAuthorized"
+[[ -d "\$sshDir" ]] || mkdir -p "\$sshDir" || exit 1
+chmod -R 700 "\$sshDir" || exit 1
+touch "\$authPath"
+chmod 600 "\$authPath"
+cat "\$pubKey" >>"\$authPath"
+rm "\$pubKey"
+REMOTE_REG
+
+# Upload file to server:
+echo " * Uploading public key to server... (password may still be required)"
+scp -q "$fileIDPublicPath" "$remoteCredentials:./$remotePublicIDUploadName" \
+    || throwError "Couldn't upload the public key !"
+scp -q "$remoteRegisterScriptLocal" "$remoteCredentials:./$remoteRegisterScriptRemote" \
+    || throwError "Couldn't upload the registering script!"
+
+# Clean local script:
+rm "$remoteRegisterScriptLocal"
+
+# Execute remote registering:
+echo " * Update remote authorized keys... (password may still be required)"
+ssh "$remoteCredentials" \
+    "chmod +x \"./$remoteRegisterScriptRemote\" && \"./$remoteRegisterScriptRemote\" && rm \"./$remoteRegisterScriptRemote\""
+
+# Should be done.
+cat <<GOOD_BYE
+ * Everything seems ok, you should be able to connect
+through $encryptName to $remoteServerAddress.
+ ! Note: server SSH daemon must be configured to accept
+Public Key and encryption.
+GOOD_BYE
+
+# Test a password-less connection:
+#echo " * Testing password-free connection..."
+#ssh "$remoteCredentials" "echo \"Success !\""
+
+# To be continued...
+#throwError "$NotImplemented"
+

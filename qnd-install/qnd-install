@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#qnd-install
+###############################################################################
+# Quick'n'dirty "linked" installation of specified files.
+# Generate a link in $TARGET_PREFIX/bin pointing to the source files.
+###############################################################################
+set -Cue
+
+#######################################
+# Installation parameter:
+TARGET_PREFIX="${TARGET_PREFIX:-${HOME}}"
+TARGET_BIN="${TARGET_BIN:-${TARGET_PREFIX}/bin}"
+
+#######################################
+# Check installation target directory:
+[[ -d "${TARGET_BIN}" ]] || mkdir -p "${TARGET_BIN}"
+
+#######################################
+# Now scan each passed file name:
+for eachFile ; do
+    # Build source path:
+    srcName="$( basename "$eachFile" )"
+    srcDir="$( cd "$( dirname "$eachFile" )" && pwd )"
+    srcPath="${srcDir}/${srcName}"
+
+    # Build target path:
+    tgtLocation="${TARGET_BIN}/${srcName}"
+
+    # So now check check source existance:
+    if [[ -f "${srcPath}" ]] ; then
+	# Check if target already exists:
+	if [[ -f "${tgtLocation}" ]] ; then
+	    echo "Warning: A file already exists at: ${tgtLocation}" >&2
+	else
+	    # No-one was there -> makalink
+	    ln -s "${srcPath}" "${tgtLocation}"
+	fi
+    else
+	echo "Warning: File not found: ${srcPath}" >&2
+    fi
+done
